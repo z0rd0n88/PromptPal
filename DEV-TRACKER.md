@@ -1,7 +1,7 @@
 # PromptPal — Developer Progress Tracker
 
 **Last updated:** 2026-05-15
-**Active branch:** `chore/spec-open-questions` (worktree: `.worktrees/spec-open-questions`)
+**Active branch:** `chore/spec-open-questions` (worktree: `.worktrees/spec-open-questions`) — **PR [#1](https://github.com/z0rd0n88/PromptPal/pull/1) open**, addressing reviewer feedback in-flight
 **Phase:** Specification → about to enter Phase 1 implementation
 
 This tracker is the single source of truth for what is decided, what is in flight, and what is blocked. Update it on every PR that lands in `main`. The authoritative technical detail still lives in `SPEC.md`; this file tracks execution against it.
@@ -85,11 +85,13 @@ Phase ordering is dependency-driven. Earlier phases unblock later ones; do not r
 
 | Task | Owner | Status | Blocker | Notes |
 |------|-------|--------|---------|-------|
-| `core/cli_backend.py` — `claude -p` subprocess | unassigned | 📋 PLANNED | — | `SPEC.md` §6.4 |
-| Use `--input-format=stream-json --output-format=stream-json` (D-07) | unassigned | 📋 PLANNED | — | NO prompt flattening |
-| Pass `--bare --system-prompt-file <path>` (D-10) | unassigned | 📋 PLANNED | — | Hard requirement; cost-critical |
+| **PRECONDITION SPIKE: `--bare` refinement quality** | unassigned | ⏸️ BLOCKED | Phase 1.8 task "Author `core/system_prompt.txt` v0.1" must produce a draft prompt first | Run `claude -p --bare --system-prompt-file <draft>` on 5–10 representative refinement inputs; capture cost (target: cents, not dimes) AND output quality vs. an `ApiBackend` baseline. Document results in this row. Implementation cannot start until quality is judged acceptable. |
+| `core/cli_backend.py` — `claude -p` subprocess | unassigned | 📋 PLANNED | Spike above | `SPEC.md` §6.4 |
+| Use `--input-format=stream-json --output-format=stream-json` (D-07) | unassigned | 📋 PLANNED | Spike above | NO prompt flattening; envelope shape per `SPEC.md` §6.4 |
+| Pass `--bare --system-prompt-file <path>` (D-10) | unassigned | 📋 PLANNED | Spike above | Hard requirement; cost-critical |
 | Pass `--model` through unchanged (D-08) | unassigned | 📋 PLANNED | — | Same strings as API |
-| Tests: stream-json roundtrip, `--bare` override, model passthrough, subprocess error | unassigned | 📋 PLANNED | — | — |
+| Pass `--no-session-persistence` to keep state in-memory only | unassigned | 📋 PLANNED | — | Avoids polluting user's own `claude --resume` history |
+| Tests: stream-json roundtrip, `--bare` flag assertion, system-prompt-file path assertion, model passthrough, subprocess error, error-envelope parsing | unassigned | 📋 PLANNED | — | Per `SPEC.md` §14 test rows |
 
 ### Phase 1.5 — Refinement loop + diff
 
@@ -119,12 +121,14 @@ Phase ordering is dependency-driven. Earlier phases unblock later ones; do not r
 
 ### Phase 1.8 — Bundled system prompt + `--update-system-prompt`
 
+> ⚠️ **Phase 1.4 (CLI backend) and Phase 1.4's `--bare` quality spike both depend on the v0.1 prompt content existing.** This phase has effective Phase 0 priority — schedule it alongside Phase 1.0/1.1, not after Phase 1.7.
+
 | Task | Owner | Status | Blocker | Notes |
 |------|-------|--------|---------|-------|
-| Author `core/system_prompt.txt` v0.1 | unassigned | 📋 PLANNED | — | Per D-06 |
-| Generate `core/system_prompt.sha256` and check both into the package | unassigned | 📋 PLANNED | — | — |
+| **Author `core/system_prompt.txt` v0.1 — actual prompt content** | unassigned | 📋 PLANNED | — | Per D-06. This is the prompt-engineering task itself, not the file plumbing. Owner needs prompt-engineering judgment, not just code. Iterate with the Phase 1.4 spike. |
+| Generate `core/system_prompt.sha256` and check both into the package | unassigned | 📋 PLANNED | Prompt content above | Trivial once content is locked |
 | `--update-system-prompt` fetcher with sha256 verification | unassigned | 📋 PLANNED | — | Atomic replace on success only |
-| Tests: hash mismatch refuses to replace, network error keeps existing prompt | unassigned | 📋 PLANNED | — | — |
+| Tests: hash mismatch refuses to replace, network error keeps existing prompt, fetched file matches sha256 sidecar | unassigned | 📋 PLANNED | — | — |
 
 ### Phase 1.9 — Tests (unit, integration, E2E)
 
@@ -141,7 +145,8 @@ Phase ordering is dependency-driven. Earlier phases unblock later ones; do not r
 |------|-------|--------|---------|-------|
 | Build signed `.msi` or `.exe` installer | unassigned | 📋 PLANNED | Code-signing cert | Per D-02 |
 | Windows launcher: `wsl -d Ubuntu -- promptpal "$@"` passthrough | unassigned | 📋 PLANNED | — | Argument quoting matters |
-| winget manifest authoring | unassigned | 📋 PLANNED | — | — |
+| **Revise `SPEC.md` §15 (Build and Release) for winget + signing pipeline** | unassigned | 📋 PLANNED | — | The current `package.sh` tarball workflow in §15 predates D-02. Replace with: signed-installer build steps, winget manifest format, submission flow. |
+| winget manifest authoring | unassigned | 📋 PLANNED | §15 revision | — |
 | Submit to `microsoft/winget-pkgs` | unassigned | 📋 PLANNED | Awaiting installer | Review timeline unknown — see Open Risks |
 
 ---
@@ -165,12 +170,26 @@ Distinct from resolved questions. Active threats to delivery.
 
 ---
 
+## Follow-ups (track, don't block this PR)
+
+Surfaced by review feedback on PR #1. Track but do not gate this PR on them.
+
+| ID | Item | Why now-but-not-blocking | Owner | Status |
+|----|------|--------------------------|-------|--------|
+| F-01 | Declare `claude` CLI version floor (≥ 2.1.143) | Native stream-json multi-turn was verified on 2.1.143; older versions may lack `--input-format=stream-json` or `--bare`. Decide: hard-block on too-old, or warn-and-proceed. Ship in Phase 1.4. | unassigned | 📋 PLANNED |
+| F-02 | Decide governance for decisions log: canonicalize this DEV-TRACKER OR backfill `docs/adr/0001-…md` files | Currently silently forked: the spec body, §16 resolutions, and DEV-TRACKER decisions log can drift. Pick one source of truth before D-11+ accumulate. | unassigned | 📋 PLANNED |
+| F-04 | Re-litigate D-03 (`preferred_backend` silent persistence) UX once users exercise `--backend` | Reviewer flagged that silent persistence is a UX trap; we mitigate with a one-line confirmation print, but watch for confusion in early users. Revisit before public-launch. | unassigned | 📋 PLANNED |
+
+(Item 10 from the review — adding a Phase 1.10 row for the §15 revision — is now an in-line task, see Phase 1.10 above.)
+
+---
+
 ## Next Concrete Actions
 
 Pick up immediately. Each item is independently mergeable.
 
-1. Commit the §16 resolutions (D-04 through D-10) onto `chore/spec-open-questions` so `SPEC.md` reflects the decisions.
-2. Open PR for `chore/spec-open-questions` → `main` with the decisions log diff and the `--bare` / `--system-prompt-file` requirement noted in the body.
-3. Spike `claude -p --bare --system-prompt-file <draft>` round-trip on a sample refinement prompt; capture cost + quality vs. the default system prompt and post results in the PR.
-4. Draft `core/system_prompt.txt` v0.1 and commit `core/system_prompt.sha256` alongside it (Phase 1.8 prerequisite).
+1. ~~Commit the §16 resolutions onto `chore/spec-open-questions`.~~ ✅ **DONE** (commit `03f288b`)
+2. ~~Open PR for `chore/spec-open-questions` → `main`.~~ ✅ **DONE** ([PR #1](https://github.com/z0rd0n88/PromptPal/pull/1))
+3. Address PR #1 review feedback in a follow-up commit on the same branch (this commit). Specifically: fix §10 to match D-03; rewrite §6 CliBackend pseudocode for stream-json + `--bare`; canonicalize `core/system_prompt.txt` path across §3, install.sh, defaults; replace stale §14 test row.
+4. Author `core/system_prompt.txt` v0.1 content and run the Phase 1.4 `--bare` quality spike against it before any CLI-backend implementation work begins.
 5. Verify `.worktrees/` is gitignored on `main` via subpath probe; add the entry if absent before the next worktree is created.

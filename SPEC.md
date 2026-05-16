@@ -56,7 +56,7 @@ PromptPal is a two-phase local tool. Phase 1 delivers a bash CLI (`promptpal`) b
 │                ~/.promptpal/ (shared store)               │
 │                                                           │
 │   config.json                                            │
-│   system-prompt.md                                       │
+│   system_prompt.txt                                       │
 │   history/                                               │
 │     index.json                                           │
 │     <uuid>.json  (one per session)                       │
@@ -87,11 +87,13 @@ promptpal/
 │   ├── improve.py             # pipeline orchestrator
 │   ├── backend.py             # backend ABC + auto-detection factory
 │   ├── api_backend.py         # Anthropic HTTP client
-│   ├── cli_backend.py         # Claude CLI subprocess wrapper
+│   ├── cli_backend.py         # Claude CLI subprocess wrapper (stream-json + --bare)
 │   ├── platform.py            # WSL detection, clipboard, HOME guard
 │   ├── history.py             # session persistence
 │   ├── config.py              # config loader/writer
-│   └── diff.py                # diff rendering
+│   ├── diff.py                # diff rendering
+│   ├── system_prompt.txt      # bundled canonical PromptPal system prompt (D-06)
+│   └── system_prompt.sha256   # sha256 of system_prompt.txt; verified on update
 ├── tests/
 │   ├── unit/
 │   │   ├── test_api.py
@@ -107,9 +109,6 @@ promptpal/
 │       └── test_flags.py
 ├── install.sh                 # one-liner installer
 ├── uninstall.sh
-├── defaults/
-│   ├── config.json            # default config template
-│   └── system-prompt.md       # default Prompt Builder system prompt
 ├── completions/
 │   ├── promptpal.bash
 │   ├── promptpal.zsh
@@ -124,7 +123,8 @@ promptpal/
 ```
 ~/.promptpal/
 ├── config.json
-├── system-prompt.md
+├── system_prompt.txt          # writable copy; seeded from core/system_prompt.txt
+├── system_prompt.sha256       # hash of the active local prompt
 ├── usage.log
 ├── history/
 │   ├── index.json
@@ -204,10 +204,10 @@ The `backend` field on each turn enables per-turn provenance tracking if the use
   "default_iterations": 1,
   "auto_copy": false,
   "show_diff": true,
-  "system_prompt_path": "~/.promptpal/system-prompt.md",
+  "system_prompt_path": "~/.promptpal/system_prompt.txt",
   "history_enabled": true,
   "max_history_entries": 500,
-  "system_prompt_update_url": "",
+  "system_prompt_update_url": "https://raw.githubusercontent.com/z0rd0n88/PromptPal/main/core/system_prompt.txt",
   "preferred_backend": "auto"
 }
 ```
@@ -442,7 +442,7 @@ class ApiBackend(Backend):
 {
   "model": "claude-sonnet-4-6",
   "max_tokens": 4096,
-  "system": "<contents of system-prompt.md>",
+  "system": "<contents of system_prompt.txt>",
   "messages": [
     {"role": "user", "content": "raw prompt text"},
     {"role": "assistant", "content": "improved prompt text"},
@@ -472,15 +472,22 @@ Network Error     → retry once after 2s, then fail with message
 
 ### Claude CLI Backend (`core/cli_backend.py`)
 
-Invokes `claude -p "<flattened_prompt>"` as a subprocess.
+Spawns `claude -p` with stream-json input/output for native multi-turn (D-07), overriding the default Claude Code system prompt (~28k cache-creation tokens, ~\$0.10/turn) with PromptPal's bundled prompt-improver prompt via `--bare --system-prompt-file` (D-10). Verified against `claude 2.1.143`.
 
 ```python
 from core.backend import Backend, BackendResponse
-import subprocess, shutil, sys
+import subprocess, shutil, sys, json
+
+# Native stream-json multi-turn was verified on this version. Older versions
+# may lack `--input-format=stream-json` or the `--bare` flag; warn at startup
+# (do not block) until the floor is formally declared (see DEV-TRACKER F-01).
+CLAUDE_VERSION_FLOOR = "2.1.143"
+
 
 class CliBackend(Backend):
-    def __init__(self, model: str):
+    def __init__(self, model: str, system_prompt_path: str):
         self.model = model
+        self._system_prompt_path = system_prompt_path  # absolute path to system_prompt.txt
         self._claude_path = shutil.which("claude")
         if not self._claude_path:
             raise FileNotFoundError("claude CLI not found on PATH")
@@ -490,52 +497,102 @@ class CliBackend(Backend):
         return f"claude-cli ({self.model})"
 
     def check_auth(self) -> bool:
-        result = subprocess.run(
+        return subprocess.run(
             [self._claude_path, "--version"],
-            capture_output=True, text=True
+            capture_output=True, text=True,
+        ).returncode == 0
+
+    def complete(self, system: str, messages: list[dict]) -> BackendResponse:
+        # The `system` argument is intentionally ignored — the bundled
+        # system_prompt.txt at self._system_prompt_path is the canonical
+        # source of system instructions for this backend (D-10).
+        # ApiBackend uses the same file content as its `system` field,
+        # so the two backends agree on the prompt.
+        cmd = [
+            self._claude_path,
+            "-p",
+            "--bare",
+            "--input-format=stream-json",
+            "--output-format=stream-json",
+            "--no-session-persistence",
+            "--model", self.model,
+            "--system-prompt-file", self._system_prompt_path,
+        ]
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
-        return result.returncode == 0
 
-    def complete(self, system: str, messages: list[dict],
-                 stream: bool = False) -> BackendResponse:
-        full_prompt = _build_prompt(system, messages)
-        cmd = [self._claude_path, "--model", self.model, "-p", full_prompt]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        # Stream-json envelope per turn (one JSON object per line on stdin).
+        # We feed the entire `messages` history each call — same contract
+        # as the API backend — instead of relying on CLI session state.
+        for m in messages:
+            envelope = {
+                "type": m["role"],  # "user" or "assistant"
+                "message": {"role": m["role"], "content": m["content"]},
+            }
+            proc.stdin.write(json.dumps(envelope) + "\n")
+        proc.stdin.close()
 
-        if result.returncode != 0:
-            stderr = result.stderr.strip()
+        # Parse stream-json envelopes off stdout. The terminal envelope is
+        # `{"type":"result","is_error":<bool>,"result":"<text>","usage":{...}}`.
+        # Intermediate events are filtered (we don't pass --include-partial-messages,
+        # so we don't expect any). Non-JSON noise is tolerated defensively.
+        text = ""
+        input_tokens = output_tokens = None
+        for line in proc.stdout:
+            try:
+                evt = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if evt.get("type") != "result":
+                continue
+            if evt.get("is_error"):
+                raise RuntimeError(evt.get("result") or "claude CLI error")
+            text = evt.get("result", "")
+            usage = evt.get("usage") or {}
+            input_tokens = usage.get("input_tokens")
+            output_tokens = usage.get("output_tokens")
+
+        rc = proc.wait()
+        if rc != 0:
+            stderr = proc.stderr.read().strip()
             if _is_auth_error(stderr):
-                print(
-                    "Claude CLI auth failed. Run: claude auth login",
-                    file=sys.stderr
-                )
+                print("Claude CLI auth failed. Run: claude auth login", file=sys.stderr)
                 sys.exit(1)
-            raise RuntimeError(f"claude CLI error: {stderr}")
+            raise RuntimeError(f"claude CLI exited {rc}: {stderr}")
 
         return BackendResponse(
-            text=result.stdout.strip(),
-            input_tokens=None,   # CLI doesn't expose token counts
-            output_tokens=None,
+            text=text.strip(),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
         )
 
-def _build_prompt(system: str, messages: list[dict]) -> str:
-    """
-    Flatten system prompt + messages into a single string for -p flag.
-    Phase 1 fallback; update if claude CLI gains native multi-turn flags (S-1).
-    """
-    parts = [system, ""]
-    for m in messages:
-        role = "Human" if m["role"] == "user" else "Assistant"
-        parts.append(f"{role}: {m['content']}")
-    return "\n".join(parts)
 
 def _is_auth_error(stderr: str) -> bool:
     auth_patterns = ["authentication", "unauthorized", "auth", "login", "token"]
     return any(p in stderr.lower() for p in auth_patterns)
 ```
 
-**Model passthrough:** `--model` flag forwarded as `claude --model <name>`.  
-**Token counts:** Not available from CLI subprocess; recorded as `null` in history.
+**Stream-json envelope shape (D-07):**
+
+- **stdin (one JSON object per line):** `{"type":"<role>","message":{"role":"<role>","content":"<text>"}}` where `<role>` is `"user"` or `"assistant"`. The full conversation is sent each turn — the subprocess holds no state between calls.
+- **stdout:** the single envelope we consume is `{"type":"result","is_error":<bool>,"result":"<assistant text>","usage":{"input_tokens":<n>,"output_tokens":<n>,...}}`. Without `--include-partial-messages`, no intermediate events are emitted. Defensive parsing (`json.JSONDecodeError` → skip) covers any future preamble noise the CLI might add.
+
+**Why `--bare`:** Suppresses Claude Code's full default system prompt, hooks, LSP, plugin sync, attribution, auto-memory, background prefetches, keychain reads, and CLAUDE.md auto-discovery. Forces auth via `ANTHROPIC_API_KEY` or `apiKeyHelper` only — exactly the isolated subprocess we want for refinement. Without `--bare`, a trivial probe burned 27,982 cache-creation tokens (~\$0.10) loading Code's system prompt (D-10).
+
+**Why `--system-prompt-file` (not `--system-prompt`):** Reads from disk so the bundled `core/system_prompt.txt` is the single source of truth and a hash check (`core/system_prompt.sha256`) can verify integrity on `--update-system-prompt`. Avoids embedding the prompt in argv (which would show up in `ps` output and hit shell argv length limits).
+
+**Why `--no-session-persistence`:** Prevents the CLI from writing this conversation to its own on-disk session store (`~/.config/claude/`), which would conflict with PromptPal's `~/.promptpal/history/` and confuse `claude --resume` for the user's own future sessions.
+
+**Why neither `--continue` nor `--resume`/`--session-id`:** Both force the CLI to own conversation state on disk. Our in-memory `messages` list is the source of truth; stream-json round-tripping the full history each turn keeps the `Backend` contract clean and makes the subprocess stateless.
+
+**Model passthrough (D-08):** `--model <id>` forwarded unchanged. Verified end-to-end that `claude --model claude-sonnet-4-6` accepts the same alias and full-name strings as the API.
+
+**Token counts:** Available from the `usage` object in the result envelope; recorded in history.
 
 ### Pipeline Integration (`core/improve.py`)
 
@@ -751,10 +808,10 @@ class Config:
     default_iterations: int = 1
     auto_copy: bool = False
     show_diff: bool = True
-    system_prompt_path: str = "~/.promptpal/system-prompt.md"
+    system_prompt_path: str = "~/.promptpal/system_prompt.txt"
     history_enabled: bool = True
     max_history_entries: int = 500
-    system_prompt_update_url: str = ""
+    system_prompt_update_url: str = "https://raw.githubusercontent.com/z0rd0n88/PromptPal/main/core/system_prompt.txt"
     preferred_backend: str = "auto"    # "auto" | "claude-cli" | "api-key"
 
 def load_config(home: str) -> Config:
@@ -770,7 +827,14 @@ CLI flags override config values. Merge order: defaults → config.json → CLI 
 
 ### Backend Selection
 
-Merge order: `Config.preferred_backend` → `--backend` CLI flag → auto-detection. The `--backend` flag applies to the current invocation only and does not persist to `config.json`.
+Merge order on each invocation: `Config.preferred_backend` → `--backend` CLI flag → auto-detection.
+
+Per D-03, `--backend <name>` **persists** to `config.json` so subsequent invocations default to the same backend without re-passing the flag. Persistence rules:
+
+- Persist via the same atomic `tempfile.mkstemp` → `os.rename` pattern used for history writes.
+- Write only when the resolved backend differs from the current on-disk value (avoids spurious mtime churn on every call).
+- `--backend auto` is the explicit reset path: it clears `preferred_backend` (writing `"auto"` back) and re-runs auto-detection on the current invocation.
+- The CLI prints a one-line confirmation on persistence (e.g. `Saved preferred_backend = api-key to ~/.promptpal/config.json`) so the side effect is visible.
 
 `ANTHROPIC_API_KEY` is read exclusively from the environment variable, never from config. When the API backend is selected and the key is absent:
 
@@ -825,11 +889,12 @@ command -v curl >/dev/null || command -v wget >/dev/null || { echo "Error: curl 
 mkdir -p "$INSTALL_DIR" "$PROMPTPAL_HOME/history"
 # ... download bin/ and core/ files
 
-# 4. Write default config (only if not exists)
-[[ -f "$PROMPTPAL_HOME/config.json" ]] || cp defaults/config.json "$PROMPTPAL_HOME/config.json"
+# 4. config.json is written on first run by core/setup.py from dataclass defaults
+#    (Python is the canonical writer per D-05 — bash never touches JSON).
 
-# 5. Write default system prompt (only if not exists)
-[[ -f "$PROMPTPAL_HOME/system-prompt.md" ]] || cp defaults/system-prompt.md "$PROMPTPAL_HOME/system-prompt.md"
+# 5. Seed default system prompt (only if not exists) from the bundled core/ copy.
+[[ -f "$PROMPTPAL_HOME/system_prompt.txt" ]] || cp "$INSTALL_DIR/../core/system_prompt.txt" "$PROMPTPAL_HOME/system_prompt.txt"
+[[ -f "$PROMPTPAL_HOME/system_prompt.sha256" ]] || cp "$INSTALL_DIR/../core/system_prompt.sha256" "$PROMPTPAL_HOME/system_prompt.sha256"
 
 # 6. Make binary executable and ensure install dir is on PATH
 chmod +x "$INSTALL_DIR/promptpal"
@@ -862,7 +927,7 @@ PromptPal — first run setup
 ────────────────────────────
 Config directory: ~/.promptpal/  ✓ created
 Default config:   ~/.promptpal/config.json  ✓ written
-System prompt:    ~/.promptpal/system-prompt.md  ✓ written
+System prompt:    ~/.promptpal/system_prompt.txt  ✓ written
 
 ANTHROPIC_API_KEY is set.  ✓
 
@@ -956,7 +1021,10 @@ Both CLI and GUI write history files independently. Atomic rename (POSIX) preven
 | `test_force_cli_backend` | `resolve_backend("claude-cli")` returns `CliBackend` |
 | `test_force_cli_missing` | `resolve_backend("claude-cli")` raises `FileNotFoundError` when `claude` not on PATH |
 | `test_cli_backend_auth_error` | Auth error in claude stderr maps to correct exit message |
-| `test_cli_backend_prompt_flattening` | `_build_prompt` produces correct `Human`/`Assistant` format for multi-turn messages |
+| `test_cli_backend_stream_json_roundtrip` | Mock `claude` subprocess; verify each `messages` turn becomes one stream-json envelope on stdin and the `result` envelope on stdout populates `BackendResponse.text` + `input_tokens`/`output_tokens` |
+| `test_cli_backend_passes_bare_and_system_prompt_file` | Assert spawned argv contains `--bare`, `--no-session-persistence`, and `--system-prompt-file <path>` (D-10 hard requirement) |
+| `test_cli_backend_ignores_system_arg` | `complete(system="ignored", ...)` does not propagate the arg to the subprocess; only the bundled file is used |
+| `test_cli_backend_result_error_envelope` | `{"type":"result","is_error":true,"result":"..."}` raises `RuntimeError` with the message text |
 
 **`tests/unit/test_platform.py`**
 
