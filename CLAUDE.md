@@ -14,10 +14,10 @@ Phase 1 is a bash entrypoint (`bin/promptpal`) that delegates immediately to a P
 
 The central design decision is a `Backend` ABC (`core/backend.py`) with two concrete implementations:
 
-- `core/api_backend.py` — Anthropic Messages API over HTTP
-- `core/cli_backend.py` — `claude -p` subprocess with multi-turn prompt flattening
+- `core/api_backend.py` — Anthropic Messages API over HTTP (SSE streaming)
+- `core/cli_backend.py` — `claude -p` subprocess using **native stream-json multi-turn** (`--input-format=stream-json --output-format=stream-json`). Always invoked with `--bare` + `--system-prompt-file` so PromptPal's refinement prompt replaces Code's default ~28k-token system prompt — without `--bare` a trivial call costs ~$0.10.
 
-Auto-detection at startup: Claude CLI on PATH → preferred; `ANTHROPIC_API_KEY` in env → fallback; neither → exit 1 with instructions for both options. Override via `--backend` flag or `preferred_backend` in config.
+Auto-detection at startup: Claude CLI on PATH → preferred; `ANTHROPIC_API_KEY` in env → fallback; neither → exit 1 with instructions for both options. Override via `--backend` flag or `preferred_backend` in config (persisted on `--backend <name>`; `--backend auto` clears it).
 
 ### Data Flow
 
@@ -50,6 +50,10 @@ The PRD uses an immutable amendment pattern: `PRD.md` is never rewritten; change
 
 ## Open Questions (from SPEC.md §16)
 
-Before implementing, resolve at minimum:
-- **S-2 (blocking):** Verify `claude --model <id>` accepts the same model ID strings as the API before wiring up `--model` passthrough in `CliBackend`.
-- **S-1:** Check whether `claude` CLI supports native multi-turn flags; if yes, replace `_build_prompt` flattening in `cli_backend.py`.
+All ten original open questions are now resolved (see SPEC.md §16 for the inline rationale per item). Pre-implementation status:
+
+- **S-1, S-2, S-3** — all resolved by direct probes of `claude 2.1.143` and `clip.exe` on 2026-05-15.
+- **CLI runtime, `jq`, system prompt source, GUI timeline, distribution, `preferred_backend` persistence** — all decided.
+- **Net-new constraint surfaced:** `CliBackend` must pass `--bare --system-prompt-file <bundled-prompt>` on every call to suppress the Claude Code default system prompt (~28k cache-creation tokens, ~$0.10 per trivial turn).
+
+Track implementation progress in [`DEV-TRACKER.md`](DEV-TRACKER.md).
