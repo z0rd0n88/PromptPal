@@ -1,126 +1,92 @@
-"""Tests for core/config.py (US-001 smoke + US-002 will extend)."""
+"""Tests for the Config dataclass (US-001 scope, SPEC §10).
+
+US-001 only locks the dataclass shape and parity with the bundled
+``defaults/config.json``. The full load-from-file / CLI-override /
+corrupt-file / unknown-field tolerance pipeline lands in US-002.
+"""
 
 from __future__ import annotations
 
 import json
-
-import pytest
+from pathlib import Path
 
 from core.config import (
+    DEFAULT_MAX_HISTORY_ENTRIES,
+    DEFAULT_MODEL,
+    DEFAULT_SYSTEM_PROMPT_PATH,
+    DEFAULT_SYSTEM_PROMPT_UPDATE_URL,
     Config,
-    ConfigCorruptError,
-    apply_overrides,
-    load_config,
-    normalize_preferred_backend,
-    save_config,
 )
 
 
-def test_defaults():
-    c = Config()
-    assert c.default_model == "claude-sonnet-4-6"
-    assert c.preferred_backend == "auto"
-    assert c.max_history_entries == 500
-    assert c.auto_copy is False
-    assert c.default_output_format == "plain"
-    assert c.api_version == "2023-06-01"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULTS_FILE = REPO_ROOT / "defaults" / "config.json"
 
 
-def test_normalize_preferred_backend_passthrough():
-    for v in ("auto", "claude-cli", "api-key"):
-        assert normalize_preferred_backend(v, warn=False) == v
+SPEC_FIELDS = frozenset(
+    {
+        "version",
+        "default_model",
+        "default_iterations",
+        "auto_copy",
+        "show_diff",
+        "system_prompt_path",
+        "history_enabled",
+        "max_history_entries",
+        "system_prompt_update_url",
+        "preferred_backend",
+    }
+)
 
 
-def test_normalize_preferred_backend_invalid(capsys):
-    assert normalize_preferred_backend("nope") == "auto"
-    err = capsys.readouterr().err
-    assert "invalid preferred_backend" in err
-    assert "auto" in err
+def test_config_has_exactly_the_spec_fields():
+    """SPEC §10 mandates these 10 fields and no others."""
+    assert Config.field_names() == SPEC_FIELDS
 
 
-def test_apply_overrides_unknown_field_ignored():
-    base = Config()
-    merged = apply_overrides(base, {"unknown_field": 42}, warn=False)
-    assert not hasattr(merged, "unknown_field")
-    assert merged.default_model == base.default_model
-
-
-def test_apply_overrides_type_mismatch_falls_back(capsys):
-    base = Config()
-    merged = apply_overrides(base, {"max_history_entries": "not-an-int"})
-    assert merged.max_history_entries == 500
-    assert "expected int" in capsys.readouterr().err
-
-
-def test_apply_overrides_bool_strict(capsys):
-    base = Config()
-    merged = apply_overrides(base, {"auto_copy": "true"})
-    assert merged.auto_copy is False
-    assert "expected bool" in capsys.readouterr().err
-
-
-def test_apply_overrides_real_values():
-    base = Config()
-    merged = apply_overrides(
-        base,
-        {"default_model": "claude-opus-4-7", "max_history_entries": 10, "auto_copy": True},
-        warn=False,
-    )
-    assert merged.default_model == "claude-opus-4-7"
-    assert merged.max_history_entries == 10
-    assert merged.auto_copy is True
-
-
-def test_apply_overrides_clamps_preferred_backend():
-    base = Config()
-    merged = apply_overrides(base, {"preferred_backend": "bogus"}, warn=False)
-    assert merged.preferred_backend == "auto"
-
-
-def test_load_config_missing_file_returns_defaults(tmp_path):
-    cfg = load_config(tmp_path / "absent.json")
-    assert cfg.default_model == Config().default_model
-
-
-def test_load_config_corrupt_raises(tmp_path):
-    p = tmp_path / "config.json"
-    p.write_text("not json {{{", encoding="utf-8")
-    with pytest.raises(ConfigCorruptError):
-        load_config(p)
-
-
-def test_load_config_non_object_raises(tmp_path):
-    p = tmp_path / "config.json"
-    p.write_text("[1, 2, 3]", encoding="utf-8")
-    with pytest.raises(ConfigCorruptError):
-        load_config(p)
-
-
-def test_save_then_load_roundtrip(tmp_path):
-    cfg = Config(default_model="m", max_history_entries=7, auto_copy=True)
-    path = tmp_path / "config.json"
-    save_config(cfg, path)
-    assert path.read_bytes().endswith(b"\n")
-    assert b"\r\n" not in path.read_bytes()
-    loaded = load_config(path)
-    assert loaded.default_model == "m"
-    assert loaded.max_history_entries == 7
-    assert loaded.auto_copy is True
-
-
-def test_save_uses_atomic_write(tmp_path, monkeypatch):
+def test_config_defaults():
     cfg = Config()
-    path = tmp_path / "config.json"
-    save_config(cfg, path)
-    # No temp files left behind.
-    leftovers = [p for p in tmp_path.iterdir() if p.name.startswith(".config-")]
-    assert leftovers == []
+    assert cfg.version == 1
+    assert cfg.default_model == DEFAULT_MODEL
+    assert cfg.default_iterations == 1
+    assert cfg.auto_copy is False
+    assert cfg.show_diff is True
+    assert cfg.system_prompt_path == DEFAULT_SYSTEM_PROMPT_PATH
+    assert cfg.history_enabled is True
+    assert cfg.max_history_entries == DEFAULT_MAX_HISTORY_ENTRIES
+    assert cfg.system_prompt_update_url == DEFAULT_SYSTEM_PROMPT_UPDATE_URL
+    assert cfg.preferred_backend == "auto"
 
 
-def test_defaults_config_json_keys_match_dataclass():
-    from pathlib import Path
+def test_max_history_entries_default_matches_prd():
+    """PRD §11 risks table: default 500."""
+    assert DEFAULT_MAX_HISTORY_ENTRIES == 500
 
-    repo_root = Path(__file__).resolve().parents[2]
-    raw = json.loads((repo_root / "defaults" / "config.json").read_text(encoding="utf-8"))
-    field_names = set(Config().to_dict().keys())
-    assert set(raw.keys()) == field_names
+
+def test_defaults_config_json_exists():
+    """P1-INST-04 / US-001 AC: bundled defaults file is shipped in the repo."""
+    assert DEFAULTS_FILE.is_file(), f"missing: {DEFAULTS_FILE}"
+
+
+def test_defaults_file_values_match_dataclass():
+    """Every value in ``defaults/config.json`` equals the in-code default."""
+    data = json.loads(DEFAULTS_FILE.read_text(encoding="utf-8"))
+    cfg = Config()
+    for key, value in data.items():
+        assert hasattr(cfg, key), f"defaults/config.json has unknown field: {key}"
+        assert getattr(cfg, key) == value, (
+            f"defaults/config.json[{key}] = {value!r} differs from dataclass default {getattr(cfg, key)!r}"
+        )
+
+
+def test_defaults_file_covers_all_dataclass_fields():
+    """Every Config field is represented in ``defaults/config.json``."""
+    data = json.loads(DEFAULTS_FILE.read_text(encoding="utf-8"))
+    assert Config.field_names() == frozenset(data.keys())
+
+
+def test_resolved_system_prompt_path_expands_tilde():
+    cfg = Config(system_prompt_path="~/.promptpal/system-prompt.md")
+    resolved = cfg.resolved_system_prompt_path()
+    assert "~" not in str(resolved)
+    assert resolved.is_absolute()

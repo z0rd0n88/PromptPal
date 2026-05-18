@@ -1,13 +1,24 @@
+# Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
+*.egg-info/
 .pytest_cache/
 .coverage
-.coverage.*
 htmlcov/
 .mypy_cache/
-*.egg-info/
-build/
-dist/
-.venv/
-venv/
+.pyright/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Build artifacts
+.memsearch/
+
+# Per-developer Claude Code state (permissions, local overrides)
+.claude/settings.local.json

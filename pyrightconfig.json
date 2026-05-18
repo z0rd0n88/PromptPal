@@ -1,0 +1,8 @@
+{
+  "include": ["core", "tests", "conftest.py"],
+  "exclude": [".claude", "ralph", "skills", "defaults"],
+  "pythonVersion": "3.10",
+  "typeCheckingMode": "basic",
+  "reportMissingImports": "error",
+  "reportMissingTypeStubs": "none"
+}
