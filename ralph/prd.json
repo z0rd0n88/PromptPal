@@ -1,0 +1,299 @@
+{
+  "project": "PromptPal",
+  "branchName": "ralph/phase-1-cli",
+  "description": "PromptPal Phase 1 CLI — a bash+Python3 tool that improves prompts via Claude CLI or Anthropic API backends, with multi-turn refinement, local history, WSL2 support, and winget distribution.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Create project skeleton and Backend ABC",
+      "description": "As a developer, I want the core directory structure and Backend abstract base class in place so all subsequent stories have a stable foundation to build on.",
+      "acceptanceCriteria": [
+        "Directory structure exists: bin/, core/, tests/unit/, tests/integration/, defaults/",
+        "core/backend.py defines Backend ABC with name, complete(system, messages, stream), and check_auth() methods",
+        "core/__init__.py, core/config.py (Config dataclass with all fields from SPEC §4/§10) exist",
+        "defaults/config.json exists with all default field values",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 1,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-002",
+      "title": "Implement Config loading with merge order",
+      "description": "As a developer, I want Config to load defaults, then config.json overrides, so all components get correct runtime configuration.",
+      "acceptanceCriteria": [
+        "Config.load() merges: dataclass defaults → ~/.promptpal/config.json overrides → CLI flag overrides",
+        "Unknown fields in config.json are silently ignored",
+        "Type-mismatched fields fall back to default with a stderr warning",
+        "Corrupt config.json (JSON parse error) → exit 1 with 'Config file corrupt at ~/.promptpal/config.json. Delete it to reset.'",
+        "Config.preferred_backend accepts exactly 'auto' | 'claude-cli' | 'api-key'; other values fall back to 'auto' with stderr warning",
+        "Writes to config.json use atomic tempfile.mkstemp → os.rename pattern",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 2,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-003",
+      "title": "Implement core/platform.py — detect_platform and clipboard",
+      "description": "As a developer, I want platform detection and clipboard support so the tool behaves correctly on macOS, Linux, and WSL2.",
+      "acceptanceCriteria": [
+        "detect_platform() reads /proc/sys/kernel/osrelease; sets is_wsl=True when 'microsoft' found, wsl_version=2 when 'wsl2' found",
+        "HOME guard: if is_wsl=True and HOME starts with /mnt/c/ or /c/, print WSL launch fix message to stderr and exit 1",
+        "_resolve_home() cross-checks HOME against passwd entry; passwd wins when HOME is NTFS-mounted",
+        "Clipboard provider priority: xclip → xsel → pbcopy → clip.exe (WSL only) → none",
+        "clip.exe sends UTF-8 without BOM; verified for non-ASCII characters",
+        "When no clipboard provider is available, copy_to_clipboard() prints one-line warning to stderr and returns without error",
+        "All files written by PromptPal use LF line endings",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 3,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-004",
+      "title": "Implement ApiBackend",
+      "description": "As a developer, I want ApiBackend to call the Anthropic Messages API so users with ANTHROPIC_API_KEY can improve prompts.",
+      "acceptanceCriteria": [
+        "ApiBackend implements Backend ABC against POST /v1/messages with anthropic-version: 2023-06-01",
+        "API key read only from ANTHROPIC_API_KEY env var; never written to disk, logs, or stdout",
+        "Retry: 429 honors Retry-After (max 3 retries); 5xx exponential backoff 1s/2s/4s (max 3); network errors retry once after 2s; 401 fails immediately",
+        "complete() returns full assistant text; streams tokens to terminal when stream=True and stdout is a TTY",
+        "check_auth() performs minimal messages call with max_tokens=1",
+        "Each turn records backend: 'api-key', input_tokens, output_tokens as numeric values",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 4,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-005",
+      "title": "Implement CliBackend with stream-json pipe",
+      "description": "As a developer, I want CliBackend to invoke the claude CLI via stream-json so multi-turn context is preserved natively without role-prefix hacks.",
+      "acceptanceCriteria": [
+        "CliBackend invokes: claude --print --model <m> --bare --system-prompt-file <path> --input-format=stream-json --output-format=stream-json",
+        "messages array is fed as NDJSON on stdin; assistant/message events consumed from stdout",
+        "Auth failure detected via non-zero exit + auth keyword in stderr → 'Claude CLI auth failed. Run: claude auth login'",
+        "check_auth() runs claude --version",
+        "Each turn records backend: 'claude-cli', input_tokens: null, output_tokens: null",
+        "A prompt containing the literal substring 'Human:' produces a correct improved prompt (no role-prefix confusion)",
+        "3 successive iterations send all 5 prior messages entries as NDJSON on turn 3",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 5,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-006",
+      "title": "Implement resolve_backend and backend persistence",
+      "description": "As a developer, I want backend resolution with explicit-flag persistence so users who pick a backend keep using it without re-specifying it each run.",
+      "acceptanceCriteria": [
+        "resolve_backend(preferred, model) selection order: explicit flag → Config.preferred_backend → auto-detect (claude on PATH → CliBackend; else ANTHROPIC_API_KEY set → ApiBackend; else NoBackendError)",
+        "When preferred == 'claude-cli' and claude missing → FileNotFoundError with actionable text; no fallback to API",
+        "When preferred == 'api-key' and ANTHROPIC_API_KEY unset → env-var instructions message; no fallback to CLI",
+        "When neither backend available → exit 1 with two-option setup message containing 'Option 1 (Claude CLI):' and 'Option 2 (API key):'",
+        "--backend <claude-cli|api-key> persists to config.preferred_backend after first successful turn only",
+        "--backend auto resets config.preferred_backend to 'auto' immediately",
+        "Failed call does not persist backend choice",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 6,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-007",
+      "title": "Implement system prompt management",
+      "description": "As a developer, I want system prompt seeding and update logic so the bundled default is always available and updates are integrity-verified.",
+      "acceptanceCriteria": [
+        "core/system_prompt.txt exists with a default prompt",
+        "On first run (no ~/.promptpal/system-prompt.md), installer seeds from core/system_prompt.txt",
+        "~/.promptpal/system-prompt.md is never overwritten without explicit --update-system-prompt",
+        "--update-system-prompt downloads URL + .sha256 sidecar, verifies hash, atomically replaces ~/.promptpal/system-prompt.md; on hash mismatch → exit 1 with 'checksum mismatch' message and existing file unchanged",
+        "Before atomic replace, current file is backed up to ~/.promptpal/system-prompt.md.bak with path printed",
+        "--system-prompt FILE overrides resolved path for current invocation only (no persistence)",
+        "If system_prompt_path missing or unreadable → exit 1 with actionable message pointing to --update-system-prompt",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 7,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-008",
+      "title": "Implement history and persistence layer",
+      "description": "As a developer, I want session JSON files and an index so users can search, replay, and review past prompt refinements.",
+      "acceptanceCriteria": [
+        "One JSON file per session at ~/.promptpal/history/<uuid>.json with schema per SPEC §4",
+        "~/.promptpal/history/index.json maintained with fields: session_id, created_at, label, status, original_prompt_preview",
+        "All writes use atomic tempfile.mkstemp → os.rename; temp file cleaned up on any write failure",
+        "Session file updated on every turn with status: 'in-progress'; finalized to 'accepted' or 'discarded' on loop exit",
+        "Append-only NDJSON usage.log with one line per turn; input_tokens/output_tokens may be null",
+        "Config.max_history_entries enforced by evicting oldest entries from index and disk after every accept/discard",
+        "History write OSError is non-fatal: warns to stderr, run continues, exit code unchanged",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 8,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-009",
+      "title": "Implement prompt input resolution and diff display",
+      "description": "As a developer, I want the pipeline to accept prompts from CLI args, stdin, or interactive TTY, and show a unified diff for long outputs.",
+      "acceptanceCriteria": [
+        "promptpal \"your prompt\" reads prompt from positional arg",
+        "echo \"prompt\" | promptpal reads from stdin when stdin is not a TTY",
+        "When no arg and stdin is a TTY, prompt user for interactive input",
+        "Unified diff displayed between original and improved prompt when improved length > 3 lines",
+        "Final improved prompt written to stdout; all logs, diff chrome, spinner go to stderr",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 9,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-010",
+      "title": "Implement refinement loop (accept/iterate/discard/raw/copy)",
+      "description": "As a user, I want an interactive refinement loop so I can accept, iterate on, or discard the improved prompt in a single session.",
+      "acceptanceCriteria": [
+        "After displaying improved prompt, show choice line: [a]ccept [i]terate [d]iscard [r]aw [c]opy",
+        "[i]terate reads user feedback, appends as user turn, calls Backend.complete(), appends response, re-displays; full messages array sent every call",
+        "At minimum 3 successive iterations supported in a single session",
+        "[a]ccept writes session JSON with status: 'accepted', copies to clipboard if auto_copy or --copy, exits 0",
+        "[d]iscard writes session JSON with status: 'discarded', exits 0",
+        "[r]aw prints raw improved prompt to stderr (not stdout), re-presents choice line",
+        "[c]opy copies current improved prompt to clipboard, re-presents choice line; warns non-fatally if no provider",
+        "--iterations N runs N auto-iterations with synthesized feedback turn before presenting choice line",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 10,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-011",
+      "title": "Implement CLI argument parsing (core/cli.py)",
+      "description": "As a developer, I want all flags parsed via argparse into a CLIOptions dataclass so every feature has a clean programmatic interface.",
+      "acceptanceCriteria": [
+        "core/cli.py uses argparse; all flags from PRD §5.4 are wired: --model, --iterations, --no-history, --copy, --show-history, --replay, --system-prompt, --output, --quiet, --search, --export, --name, --update-system-prompt, --uninstall, --backend, --status",
+        "--output accepts plain | json | markdown; json emits single object {original, improved, turns, session_id, backend, model}",
+        "--quiet suppresses diff/spinner/streaming/choice; emits only improved prompt on stdout; auto-accepts after first turn",
+        "--show-history prints paginated list from index.json newest-first then exits 0",
+        "--search KEYWORD matches index original_prompt_preview and label first; falls back to scanning session files; results sorted by created_at descending",
+        "--status prints backend, model, auth check, platform, config path, history count in < 20 lines; exits 0",
+        "--export SESSION_ID dumps full session JSON to stdout and exits 0",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 11,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-012",
+      "title": "Implement bin/promptpal bash entrypoint",
+      "description": "As a user, I want a bash entrypoint that guards against WSL HOME regression and delegates to the Python core so the tool is a single command on PATH.",
+      "acceptanceCriteria": [
+        "bin/promptpal is a bash script that delegates to python3 -m core.main",
+        "Entrypoint duplicates the WSL HOME guard (HOME starts with /mnt/c/ or /c/) and exits 1 with the WSL fix message before Python starts",
+        "shellcheck bin/promptpal returns clean",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 12,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-013",
+      "title": "Implement install.sh",
+      "description": "As a user, I want install.sh to set up ~/.promptpal/ and place the binary on PATH so I can start using the tool immediately after running the one-liner.",
+      "acceptanceCriteria": [
+        "install.sh works on macOS, Linux, and WSL2 Ubuntu without extra runtime installs beyond bash, python3, curl/wget",
+        "Installer refuses to run when HOME is /mnt/c/... or /c/...; prints wsl -d Ubuntu fix and exits 1",
+        "Binary placed at $INSTALL_DIR/promptpal (default ~/.local/bin/promptpal); warns if not on PATH",
+        "~/.promptpal/ created with history/, config.json (from defaults/config.json), and system-prompt.md (from core/system_prompt.txt); existing files never overwritten",
+        "Post-install backend check runs and prints which backend(s) are configured; if none, prints two-option setup hint (non-fatal, exits 0)",
+        "shellcheck install.sh returns clean",
+        "Typecheck passes"
+      ],
+      "priority": 13,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-014",
+      "title": "Implement winget Windows launcher",
+      "description": "As a Windows user, I want a winget-distributed launcher so I can run promptpal from PowerShell without managing WSL manually.",
+      "acceptanceCriteria": [
+        "launcher/promptpal.exe (or promptpal.bat / promptpal.ps1) checks for WSL Ubuntu; if absent, prints 'wsl --install -d Ubuntu' instruction and exits 1",
+        "When WSL Ubuntu is present, forwards all args via wsl -d Ubuntu -- promptpal \"$@\"",
+        "Launcher contains no Anthropic logic",
+        "winget manifest exists and passes winget validate",
+        "Given WSL Ubuntu installed and PromptPal installed inside it, running promptpal from PowerShell returns the improved prompt to PowerShell stdout",
+        "Typecheck passes"
+      ],
+      "priority": 14,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-015",
+      "title": "Implement uninstall.sh and --replay flag",
+      "description": "As a user, I want to cleanly uninstall the tool and replay past sessions so I can maintain my environment and continue refining saved prompts.",
+      "acceptanceCriteria": [
+        "uninstall.sh removes the installed binary",
+        "uninstall.sh prompts (Yn) before removing ~/.promptpal/; --purge removes without prompting",
+        "--replay SESSION_ID loads specified session, replays messages into a new session, enters refinement loop",
+        "--name LABEL assigns human-readable label recorded in session file and index",
+        "shellcheck uninstall.sh returns clean",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 15,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-016",
+      "title": "Wire full test suite and CI matrix",
+      "description": "As a developer, I want the complete test suite passing at ≥80% coverage across all required test files so the codebase is releasable.",
+      "acceptanceCriteria": [
+        "tests/unit/test_backend.py covers all resolve_backend paths (P1-BKND-01..09)",
+        "tests/unit/test_cli_backend_streamjson.py verifies stdin NDJSON, command vector with --bare --system-prompt-file --input-format=stream-json --output-format=stream-json",
+        "tests/unit/test_backend_persistence.py covers --backend api-key persists, --backend auto clears, failed call does not persist",
+        "tests/unit/test_system_prompt.py covers bundled-default seed, no-overwrite on existing, sidecar verify, mismatch refusal",
+        "tests/unit/test_platform.py covers WSL detection, HOME guard, clipboard priority, UTF-8 round-trip",
+        "tests/unit/test_history.py covers atomic write, index upsert, eviction, search, incremental update",
+        "tests/unit/test_config.py covers defaults, file override, CLI override, corrupt file, unknown-field tolerance",
+        "tests/unit/test_diff.py covers short prompt → no diff; long prompt → unified diff",
+        "tests/integration/test_stdin.py covers arg, stdin, and interactive input paths",
+        "tests/integration/test_pipeline.py covers all loop branches with mock backend",
+        "tests/integration/test_flags.py covers one assert per flag",
+        "pytest --cov=core reports ≥ 80% coverage",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 16,
+      "passes": false,
+      "notes": ""
+    }
+  ]
+}
