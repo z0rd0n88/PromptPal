@@ -1,79 +1,56 @@
 """Backend abstract base class.
 
-All concrete backends (CliBackend, ApiBackend) implement this ABC. The
-pipeline depends only on this interface so backends can be swapped without
-touching call sites. See PRD §5.2 (P1-BKND-01) and SPEC §6.
+Authoritative shape: SPEC.md §6 (Backend Integration). Every concrete
+backend (`ApiBackend`, `CliBackend`, future additions) implements the same
+contract so the pipeline depends only on this interface.
+
+Token-count semantics (P1-BKND-10): API turns carry numeric
+`input_tokens`/`output_tokens`; CLI turns carry `None` for both.
+
+US-001 only defines the ABC. Concrete backends, `resolve_backend()`, and
+the auto-detection ladder land in US-006 (SPEC §6 "Auto-Detection").
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Iterable
 
 
 @dataclass(frozen=True)
-class CompletionResult:
-    """Result of a single Backend.complete() call.
-
-    `input_tokens` and `output_tokens` are None for backends that do not
-    expose usage (e.g. the Claude CLI).
-    """
-
+class BackendResponse:
     text: str
-    input_tokens: int | None = None
-    output_tokens: int | None = None
-
-
-@dataclass(frozen=True)
-class AuthStatus:
-    """Result of Backend.check_auth(). `ok=True` means the backend is usable."""
-
-    ok: bool
-    detail: str = ""
-
-
-class BackendError(Exception):
-    """Base class for backend-raised errors."""
-
-
-class AuthError(BackendError):
-    """Authentication failed (401, expired CLI token, etc)."""
-
-
-class NoBackendError(BackendError):
-    """No backend could be resolved."""
+    input_tokens: int | None
+    output_tokens: int | None
 
 
 class Backend(ABC):
-    """Abstract backend interface.
+    """Abstract base class for prompt-improvement backends (SPEC §6)."""
 
-    Concrete backends must set `name` to one of `"claude-cli"` or `"api-key"`
-    (the same string is persisted to session records and config).
-    """
-
-    name: str = ""
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Human-readable identifier, e.g. ``'claude-cli (claude-sonnet-4-6)'``."""
 
     @abstractmethod
     def complete(
         self,
         system: str,
-        messages: Iterable[dict[str, str]],
+        messages: list[dict],
         stream: bool = False,
-    ) -> CompletionResult:
-        """Run a single completion turn.
-
-        Args:
-            system: System prompt text.
-            messages: Sequence of {"role": "user"|"assistant", "content": str}.
-            stream: If True and stdout is a TTY, stream tokens to stderr.
-
-        Returns:
-            CompletionResult with the full assistant text.
-        """
-        raise NotImplementedError
+    ) -> BackendResponse:
+        """Execute one completion turn and return the assembled response."""
 
     @abstractmethod
-    def check_auth(self) -> AuthStatus:
-        """Lightweight liveness check used by --status."""
-        raise NotImplementedError
+    def check_auth(self) -> bool:
+        """Lightweight liveness/auth probe (used by ``--status`` and first-run setup)."""
+
+
+class NoBackendError(Exception):
+    """Raised when no backend is available and no explicit choice was made."""
+
+    MESSAGE = (
+        "Error: No backend available. Set up one of the following:\n"
+        "  Option 1 (Claude CLI): Install Claude Code and run `claude auth login`\n"
+        '  Option 2 (API key):    export ANTHROPIC_API_KEY="sk-ant-..."'
+    )
