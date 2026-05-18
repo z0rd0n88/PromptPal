@@ -34,8 +34,8 @@
         "Tests pass"
       ],
       "priority": 2,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Implemented on branch feat/us-002-config-loading. Adds load/merge/atomic-save plumbing on top of the spec-compliant 10-field Config from US-001. Public API: ConfigCorruptError, normalize_preferred_backend, apply_overrides, load_config, save_config. AC #1 merge order is realized by apply_overrides being the single chokepoint used by load_config (file overrides on Config()) and by the future CLI entry point (flag overrides on the file-merged Config). AC #2 unknown fields silently dropped. AC #3 type mismatches keep base's value and warn on stderr; strict bool/int distinction via type(value) is bool/int (Python's isinstance(True, int) caveat). AC #4 ConfigCorruptError carries the canonical 'Config file corrupt at <path>. Delete it to reset.' message for the CLI to surface verbatim; the library never sys.exit()s directly. AC #5 preferred_backend clamped through normalize_preferred_backend, which also runs from apply_overrides so the invariant holds at every layer. AC #6 save_config uses tempfile.mkstemp+os.replace in the same dir as the target path for same-filesystem atomic rename; UTF-8, LF newlines, trailing newline; cleanup on failure. 33 new tests (41 total in tests/unit/test_config.py); pytest 48/48 green across the project; pyright clean."
     },
     {
       "id": "US-003",

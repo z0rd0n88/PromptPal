@@ -2,13 +2,28 @@
 
 Authoritative schema: SPEC.md §10 (Configuration). The ten fields below
 mirror the user-editable JSON persisted at ``~/.promptpal/config.json``.
-Each field has a hard-coded default (used when no file exists) and is
-overridable in three layers per PRD P1-CFG-02:
+
+Merge order (PRD P1-CFG-02):
 
     dataclass defaults  →  config.json overrides  →  CLI flag overrides
 
-US-001 only requires that the dataclass and the bundled defaults file
-exist; the full load/merge/atomic-write pipeline lands in US-002.
+Both override layers are applied via :func:`apply_overrides`, which:
+
+- silently drops unknown fields (P1-CFG-03 / US-002 AC #2),
+- warns on stderr and keeps the base value when a field's runtime type
+  doesn't match the dataclass declaration (US-002 AC #3), and
+- clamps ``preferred_backend`` through :func:`normalize_preferred_backend`
+  so an invalid value cannot survive past this layer (US-002 AC #5).
+
+:func:`load_config` reads JSON from a path and pipes the result through
+:func:`apply_overrides`. Corrupt JSON or a non-object root raises
+:class:`ConfigCorruptError` carrying the canonical "Config file corrupt
+at <path>. Delete it to reset." message the CLI surfaces verbatim
+(US-002 AC #4).
+
+:func:`save_config` writes atomically via ``tempfile.mkstemp`` +
+``os.replace`` so a crash mid-write can never leave a half-written file
+behind (US-002 AC #6).
 
 Field provenance:
 
@@ -30,12 +45,18 @@ it to be read only from the ``ANTHROPIC_API_KEY`` env var, never from
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+import json
+import os
+import sys
+import tempfile
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 
 PreferredBackend = Literal["auto", "claude-cli", "api-key"]
+
+VALID_PREFERRED_BACKENDS: tuple[str, ...] = ("auto", "claude-cli", "api-key")
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_SYSTEM_PROMPT_PATH = "~/.promptpal/system-prompt.md"
@@ -66,3 +87,170 @@ class Config:
     def resolved_system_prompt_path(self) -> Path:
         """Return ``system_prompt_path`` with ``~`` expanded to an absolute path."""
         return Path(self.system_prompt_path).expanduser()
+
+
+class ConfigCorruptError(Exception):
+    """Raised when the on-disk config.json cannot be parsed.
+
+    Carries the canonical message "Config file corrupt at <path>. Delete
+    it to reset." that the CLI surfaces verbatim per US-002 AC #4.
+    """
+
+
+# ---------------------------------------------------------------------------
+# preferred_backend validation (US-002 AC #5)
+# ---------------------------------------------------------------------------
+
+
+def normalize_preferred_backend(value: Any, *, warn: bool = True) -> PreferredBackend:
+    """Return a valid ``PreferredBackend``, clamping invalid inputs to ``"auto"``.
+
+    Per US-002 AC #5: any value not in ``("auto", "claude-cli", "api-key")``
+    falls back to ``"auto"`` with a stderr warning. ``warn=False``
+    suppresses the warning (used by tests and by re-merge paths that have
+    already warned once).
+    """
+    if isinstance(value, str) and value in VALID_PREFERRED_BACKENDS:
+        return value  # type: ignore[return-value]
+    if warn:
+        print(
+            f"warning: invalid preferred_backend {value!r}; falling back to 'auto'",
+            file=sys.stderr,
+        )
+    return "auto"
+
+
+# ---------------------------------------------------------------------------
+# Overrides (US-002 AC #1, #2, #3, #5)
+# ---------------------------------------------------------------------------
+
+
+def _expected_type(field_name: str) -> type | None:
+    """Return the runtime type the dataclass expects for ``field_name``.
+
+    Derived from the default values on ``Config()`` so this helper stays
+    in lockstep with the dataclass without duplicating type annotations.
+    """
+    if field_name not in Config.field_names():
+        return None
+    return type(getattr(Config(), field_name))
+
+
+def _value_matches_field_type(field_name: str, value: Any) -> bool:
+    """Strict type check that distinguishes ``bool`` from ``int``.
+
+    Python's ``isinstance(True, int)`` is True; for config fields where
+    the dataclass declares ``int`` we want bools rejected, and vice versa.
+    Other primitives use ordinary ``isinstance``.
+    """
+    expected = _expected_type(field_name)
+    if expected is None:
+        return False
+    if expected is bool:
+        return type(value) is bool
+    if expected is int:
+        return type(value) is int
+    return isinstance(value, expected)
+
+
+def apply_overrides(
+    base: Config, overrides: dict[str, Any], *, warn: bool = True
+) -> Config:
+    """Return a new ``Config`` with ``overrides`` applied on top of ``base``.
+
+    - Unknown fields in ``overrides`` are silently dropped (AC #2).
+    - Fields whose override value doesn't match the dataclass type are
+      ignored with a stderr warning; ``base``'s value flows through (AC #3).
+    - ``preferred_backend`` is clamped through
+      :func:`normalize_preferred_backend` so invalid strings cannot
+      survive (AC #5).
+    - ``base`` is not mutated; the new ``Config`` is produced via
+      :func:`dataclasses.replace`.
+    """
+    known = Config.field_names()
+    accepted: dict[str, Any] = {}
+    for name, value in overrides.items():
+        if name not in known:
+            continue  # AC #2: unknown fields silently ignored
+        if name == "preferred_backend":
+            accepted[name] = normalize_preferred_backend(value, warn=warn)
+            continue
+        if not _value_matches_field_type(name, value):
+            if warn:
+                expected = _expected_type(name)
+                expected_name = expected.__name__ if expected is not None else "?"
+                got = type(value).__name__
+                print(
+                    f"warning: invalid type for {name}: expected {expected_name}, "
+                    f"got {got} ({value!r}); ignoring override",
+                    file=sys.stderr,
+                )
+            continue  # AC #3
+        accepted[name] = value
+    if not accepted:
+        return base
+    return replace(base, **accepted)
+
+
+# ---------------------------------------------------------------------------
+# Load (US-002 AC #1, #2, #3, #4)
+# ---------------------------------------------------------------------------
+
+
+def load_config(path: str | Path) -> Config:
+    """Load ``Config`` from JSON at ``path``, applying overrides on defaults.
+
+    - Missing file → ``Config()`` (no error).
+    - Valid JSON object → :func:`apply_overrides` applied to ``Config()``.
+    - Corrupt JSON or non-object root → :class:`ConfigCorruptError`.
+    """
+    path_obj = Path(path)
+    if not path_obj.exists():
+        return Config()
+    raw = path_obj.read_text(encoding="utf-8")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ConfigCorruptError(
+            f"Config file corrupt at {path_obj}. Delete it to reset."
+        ) from e
+    if not isinstance(data, dict):
+        raise ConfigCorruptError(
+            f"Config file corrupt at {path_obj}. Delete it to reset."
+        )
+    return apply_overrides(Config(), data)
+
+
+# ---------------------------------------------------------------------------
+# Save (US-002 AC #6)
+# ---------------------------------------------------------------------------
+
+
+def save_config(cfg: Config, path: str | Path) -> None:
+    """Atomically write ``cfg`` to ``path`` (UTF-8, LF, trailing newline).
+
+    Uses ``tempfile.mkstemp`` + ``os.replace`` per US-002 AC #6. The
+    tempfile is created in the same directory as ``path`` so the replace
+    is on the same filesystem (atomic on POSIX, best-effort on Windows).
+    """
+    path_obj = Path(path)
+    path_obj.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=".config-", suffix=".json", dir=str(path_obj.parent)
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            payload: dict[str, Any] = {
+                name: getattr(cfg, name) for name in Config.field_names()
+            }
+            json.dump(payload, f, indent=2)
+            f.write("\n")
+        os.replace(tmp_path, path_obj)
+    except Exception:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise
