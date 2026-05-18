@@ -1,0 +1,19 @@
+{
+  "api_base_url": "https://api.anthropic.com",
+  "api_version": "2023-06-01",
+  "auto_copy": false,
+  "config_path": "~/.promptpal/config.json",
+  "default_iterations": 0,
+  "default_model": "claude-sonnet-4-6",
+  "default_output_format": "plain",
+  "history_dir": "~/.promptpal/history",
+  "max_history_entries": 500,
+  "preferred_backend": "auto",
+  "promptpal_dir": "~/.promptpal",
+  "request_timeout_seconds": 60,
+  "spinner_enabled": true,
+  "stream_enabled": true,
+  "system_prompt_path": "~/.promptpal/system-prompt.md",
+  "system_prompt_update_url": "",
+  "usage_log_path": "~/.promptpal/usage.log"
+}

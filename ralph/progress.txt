@@ -1,0 +1,52 @@
+# Ralph Progress Log
+Started: 2026-05-18
+---
+
+## Codebase Patterns
+- Tests live in tests/unit/ and tests/integration/; root conftest.py puts the
+  repo root on sys.path so `from core.x import y` works from any cwd.
+- Config writes use the tempfile.mkstemp -> os.rename atomic pattern with a
+  '.config-' prefix; the same pattern will be reused for history/session writes
+  (US-008) — extract to a helper if a third call site appears.
+- All on-disk text is UTF-8 with LF endings (`newline="\n"` on text writes).
+- preferred_backend is normalized through `normalize_preferred_backend()` at
+  every entry point so a stale/corrupt value can never crash startup.
+
+---
+
+## 2026-05-18 - US-001
+- Created directory skeleton: bin/, core/, tests/unit/, tests/integration/,
+  defaults/.
+- core/backend.py: Backend ABC with `name`, `complete(system, messages,
+  stream)`, `check_auth()`; CompletionResult and AuthStatus dataclasses;
+  BackendError / AuthError / NoBackendError hierarchy.
+- core/config.py: Config dataclass with every field referenced by the PRD
+  (default_model, preferred_backend, system_prompt_path,
+  system_prompt_update_url, history_dir, usage_log_path, config_path,
+  promptpal_dir, max_history_entries, auto_copy, default_iterations,
+  default_output_format, api_base_url, api_version, request_timeout_seconds,
+  spinner_enabled, stream_enabled). Includes apply_overrides() (unknown-field
+  tolerance, type-mismatch fallback with stderr warning), load_config(),
+  save_config() (atomic), normalize_preferred_backend(), and ConfigCorruptError.
+- defaults/config.json mirrors every dataclass field; a test asserts the key
+  sets stay in sync.
+- conftest.py at repo root makes `core` importable from any test cwd.
+- pytest: 19 passed. mypy core/: clean.
+- Files changed: core/__init__.py, core/backend.py, core/config.py,
+  defaults/config.json, tests/__init__.py, tests/unit/__init__.py,
+  tests/unit/test_backend.py, tests/unit/test_config.py,
+  tests/integration/__init__.py, conftest.py, ralph/prd.json,
+  ralph/progress.txt.
+- **Learnings for future iterations:**
+  - The harness pinned development to branch `claude/execute-ralph-script-TN3Xk`,
+    overriding the PRD's `branchName: ralph/phase-1-cli`. Subsequent iterations
+    should keep pushing to the harness-assigned branch unless told otherwise.
+  - SPEC.md is not in the repo; PRD-PHASE1.md (§5.7, §10) is the only source of
+    truth for Config fields. Extend Config carefully when later stories add
+    references — keep dataclass and defaults/config.json in lockstep (a test
+    enforces this).
+  - apply_overrides treats `bool` strictly (not via int subtyping) — `1` will
+    be rejected for `auto_copy`. Adjust if PRD ever requires that coercion.
+  - Default field values that depend on $HOME use `field(default_factory=...)`
+    so tests can swap HOME safely.
+---
