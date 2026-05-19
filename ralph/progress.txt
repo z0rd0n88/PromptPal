@@ -118,6 +118,26 @@ Started: 2026-05-18
   `bundled_system_prompt_path` kwargs — neither was used by any code
   path; the backend factory already injects env via resolve_backend's
   `env=` kwarg, and the bundled prompt path is a module constant.)
+- Entry chain is bash -> python -m core.main -> core.cli.main. The
+  bash launcher (bin/promptpal) does ONE substantive thing besides
+  exec'ing python: it duplicates the WSL HOME guard so the fix message
+  reaches the user before python imports anything that might choke on
+  an NTFS HOME. The text printed by the bash guard MUST match
+  core.platform.WSL_LAUNCH_FIX_MESSAGE verbatim — tests pin every line
+  via test_wsl_guard_text_pins_constant. If you edit one copy, edit
+  the other in the same commit.
+- The launcher's argv-forwarding test uses a bash shim for python3
+  (writes argv to a file via printf '%s\\n' "$@") rather than spawning
+  the real interpreter. This isolates the wrapper's behaviour ("$@"
+  preservation, exec exit-code propagation) from any CLI internals.
+  Mirror this pattern when testing US-013's install.sh / US-015's
+  uninstall.sh — wrap external commands with bash shims so each test
+  pins a single shell-script contract.
+- shellcheck lives at ~/.local/bin/shellcheck inside WSL; the
+  test_shellcheck_clean test uses shutil.which and pytest.skip when
+  the binary is absent so the suite still passes on hosts without
+  shellcheck installed (CI must install it explicitly to enforce the
+  contract).
 
 ---
 
@@ -790,4 +810,66 @@ Started: 2026-05-18
     matches the coreutils convention. _parse_sidecar lowercases the input
     digest so an uppercase sidecar still verifies (defensive against
     Windows tooling that emits uppercase by default).
+---
+
+## 2026-05-19 - US-012
+- bin/promptpal NEW: bash launcher, executable. Two responsibilities:
+  (1) duplicate the WSL HOME guard from core/platform.py before Python
+  starts, (2) `exec python3 -m core.main "$@"` so Python becomes the
+  process and inherits signals cleanly. set -euo pipefail, prefix-only
+  case match on $HOME against /mnt/c/* and /c/*, dev-checkout
+  PYTHONPATH prepend gated on `core/` being adjacent.
+- core/main.py NEW: 5-statement module that re-exports `main()` from
+  core.cli and runs it under `if __name__ == "__main__"`. Exists so
+  `python3 -m core.main` is the stable launcher contract; the actual
+  CLI implementation stays in core/cli.py untouched.
+- core/cli.py: stale "until US-012 lands" comment refreshed.
+- tests/unit/test_bin_promptpal.py NEW: 19 tests covering AC #1
+  (delegation + argv-verbatim forwarding + exit-code propagation via
+  exec, both verified with a tmp_path python3 shim), AC #1b
+  (core.main.main delegates to core.cli.main via monkeypatch on the
+  `_cli_main` binding), AC #2 (WSL guard parametrised for /mnt/c/* and
+  /c/*, prefix-only matching with negative substring case, message
+  text pinned line-by-line against WSL_LAUNCH_FIX_MESSAGE, ordering
+  pinned by sending an unknown flag and asserting argparse's
+  "unrecognized" doesn't appear), AC #3 (shellcheck clean test,
+  pytest.skip if not installed), AC #4 (strict bash mode + LF line
+  endings).
+- shellcheck bootstrap: `pipx install shellcheck-py` lays down
+  `~/.local/bin/shellcheck` (v0.11.0). pipx is preinstalled; pip is
+  not. apt-sudo isn't available. Document for next iteration that
+  uses shellcheck.
+- pytest 516 passed (was 497 before US-012). pyright clean. ruff clean
+  on new files. coverage: core/main.py 100%, project 96%.
+- **Learnings for future iterations:**
+  - The launcher pattern is: bash wrapper does platform guards that
+    must beat Python's import phase, then `exec python3 -m <module>`.
+    Use `case "${HOME:-}" in /prefix/*|/other/*) ... ;; esac` for
+    prefix matching — shellcheck-clean, posix-portable, and bash's
+    glob-only semantics give you the "prefix-not-substring" behaviour
+    for free (a HOME like /tmp/foo/mnt/c won't match because there's
+    no leading prefix). Pin this with a negative test or the next
+    edit might "fix" the guard to use `[[ "$HOME" == */mnt/c/* ]]`
+    and silently break.
+  - `python3 -m core.main` requires a `core/main.py` (or
+    `core/__main__.py`) — we picked main.py so the import target
+    surfaces in tracebacks as `core.main` rather than `core.__main__`,
+    matches the launcher's command line. core/main.py imports
+    `main as _cli_main from core.cli` and re-exports; tests patch
+    `core.main._cli_main` (NOT `core.cli.main`) when verifying
+    delegation, because the re-export rebinds at import time.
+  - bash subprocess tests for argv forwarding: write a `python3`
+    shim into tmp_path/bin that does `printf "%s\n" "$@" > argsfile`,
+    point PATH at it, and read argsfile. Reliable, no eval needed,
+    catches any wrapper-side argv munging immediately.
+  - shellcheck-py is the cleanest no-sudo install path. The `pipx`
+    wrapping makes `~/.local/bin/shellcheck` an isolated venv,
+    auto-shimmed. Took one iteration to find; document so future
+    bash-script stories don't waste a cycle on it.
+  - When the harness places a parallel `tests/integration/test_*.py`
+    file that overlaps a new unit test, prefer keeping the unit-test
+    location (matches the rest of the suite) and lift in the missing
+    high-value assertions (argv shim, exit-code propagation,
+    prefix-not-substring) rather than duplicating. The Ralph harness
+    sometimes regenerates exploratory files between iterations.
 ---
