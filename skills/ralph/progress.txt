@@ -5,12 +5,14 @@ Started: Tue May 19 11:41:19 PDT 2026
 - Test runner is `uv run --with pytest --with pyright pytest tests/` from the worktree root (no pyproject.toml; no venv on disk — uv resolves a one-off env each call).
 - Typecheck is `uv run --with pytest --with pyright pyright`. pyrightconfig.json sets typeCheckingMode=basic, pythonVersion=3.10, includes core/tests/conftest.py.
 - Coverage is `uv run --with pytest --with pytest-cov pytest --cov=core.<module>`.
+- Tests MUST run via `wsl.exe -d Ubuntu -- bash -lc '...'` (Windows-native Python's uv can't import stdlib modules like `pwd` used by core/platform.py); the Windows path `\\wsl.localhost\ubuntu\...` only matters for file IO, not test execution.
 - Frozen dataclasses for immutable value types (Config exception aside — it must be mutable for `replace()`). Use `@dataclass(frozen=True)` and tuple fields, not list.
 - One module per concern under `core/`. Tests live at `tests/unit/test_<module>.py`; integration tests at `tests/integration/`.
 - Internal helpers prefixed `_` and exported via `from core.<mod> import _helper` for direct unit testing — preferred over heavy monkeypatching when the helper takes parameters that drive its decisions.
-- Canonical user-facing strings live as module-level constants (e.g. `WSL_LAUNCH_FIX_MESSAGE`, `NO_CLIPBOARD_WARNING`, `NoBackendError.MESSAGE`) and tests assert on substrings of them to catch silent drift.
+- Canonical user-facing strings live as module-level constants (e.g. `WSL_LAUNCH_FIX_MESSAGE`, `NO_CLIPBOARD_WARNING`, `NoBackendError.MESSAGE`, `AUTH_ERROR_MESSAGE`) and tests assert on substrings of them to catch silent drift.
 - File writes from PromptPal must use LF endings — `newline="\n"` on `open()` and `os.replace` for atomicity.
 - conftest.py at repo root prepends the repo root to sys.path so `from core.<mod> import ...` works without installing the package.
+- For modules with external I/O (HTTP, subprocess), expose injectable function kwargs in the constructor (`transport=`, `sleeper=`) — tests pass fakes that record calls. This keeps the production default sensible (`urllib.request.urlopen`, `time.sleep`) and avoids global monkeypatching.
 
 ---
 
@@ -26,4 +28,19 @@ Started: Tue May 19 11:41:19 PDT 2026
   - Clipboard priority test must exercise the "all three Unix providers present" case to lock in *order* (not just "xclip works when alone"). Same for "xclip wins over clip.exe on WSL".
   - `pwd` is a Linux/macOS stdlib module — pyright won't flag the import even though it's unavailable on Windows, because the tests run on WSL.
   - PRD's `branchName: "ralph/phase-1-cli"` doesn't match the one-branch-per-story workflow already in use; previous stories (US-001, US-002) used `feat/us-XXX-*` branches and that pattern is continuing here.
+---
+
+## 2026-05-19 - US-004 (core/api_backend.py)
+- Implemented `core/api_backend.py` with `ApiBackend` (concrete Backend), the SPEC §6 retry budget, SSE streaming, and `check_auth()`. Error hierarchy: `ApiError` → `ApiKeyMissingError` / `ApiAuthError` / `ApiRateLimitError` / `ApiServerError` / `ApiNetworkError`. Canonical-message constants: `NO_KEY_MESSAGE`, `AUTH_ERROR_MESSAGE`, `RATE_LIMITED_MESSAGE_TEMPLATE`, `SERVER_ERROR_MESSAGE`, `NETWORK_ERROR_MESSAGE`.
+- Added `tests/unit/test_api_backend.py` — 45 tests; project total 126; pyright clean; coverage 99% on core/api_backend.py (97% across core/).
+- Files changed: `core/api_backend.py` (new), `tests/unit/test_api_backend.py` (new), `ralph/prd.json` (US-004 → passes:true with notes), `skills/ralph/progress.txt`.
+- **Learnings for future iterations:**
+  - `ApiBackend.__init__` takes `transport=` (default `_default_transport` over urllib) and `sleeper=` (default `time.sleep`) — this lets every test run synchronously without network or wall-clock sleeps. The transport raises `_TransportNetworkError` for connection-level failures and returns `_HttpResponse(status=...)` for everything else (HTTP error codes included), so the retry loop has uniform input.
+  - Retry counters per category are **independent** in this implementation (a 429 burst does not exhaust the 5xx budget). The PRD wording "max 3 retries" was ambiguous; tests (`test_retry_categories_have_independent_counters`) pin the chosen interpretation so a later refactor doesn't drift.
+  - SSE parsing: the Anthropic stream uses `event: <type>\ndata: {json}\n\n`. The parser ignores `event:` lines and reads JSON from `data:` lines; the `[DONE]` sentinel terminates iteration. `_iter_sse` accepts any iterable of bytes lines, so tests use `io.BytesIO`.
+  - Streaming usage: `message_start` carries `input_tokens` + initial `output_tokens=1`; `message_delta` carries the final `output_tokens` (and sometimes updated `input_tokens`). Both must be consumed to produce accurate token counts in the returned `BackendResponse`.
+  - The `do_stream` decision is `bool(stream) and sys.stdout.isatty()` — when stdout is non-TTY (pipes, CI), `stream=True` silently falls back to a non-streaming request. Tests assert both branches by monkeypatching `sys.stdout.isatty`.
+  - `urllib.error.HTTPError` IS the response object for non-2xx status codes — `.code`, `.headers`, and `.read()` all work on the exception itself. The default transport catches it and converts to `_HttpResponse(status=e.code, ...)` so the retry loop never sees an exception for HTTP errors.
+  - The ANTHROPIC_API_KEY is read **only** in `__init__` (via `os.environ.get(..., "")`); empty/missing raises `ApiKeyMissingError`. The key is stored as `self._api_key` (private) and only appears in the `x-api-key` request header — never in `__repr__`, `__str__`, error messages, or retry-banner stderr lines. Test `test_key_never_leaks_to_stderr_on_auth_error` pins this.
+  - `urllib.request.urlopen` should be monkeypatched as `api_mod.urllib.request.urlopen` so the test reverts cleanly. A fake response object needs `.status`, `.headers` (dict-like), and `.read()` for non-stream; for streaming it also needs to be iterable yielding bytes lines.
 ---
