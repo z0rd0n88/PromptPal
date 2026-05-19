@@ -91,6 +91,30 @@ Started: 2026-05-18
   'accept yes' / 'A' / 'a' all map to ACTION_ACCEPT. EOF on stdin
   (readline → '') bails as STATUS_DISCARDED so a closed input stream
   cannot infinite-loop the test suite.
+- The CLI layer (core/cli.py) is the SINGLE place that touches stdout
+  for the improved prompt, the --output json envelope, and the
+  --show-history / --search / --status / --export reports. Every other
+  module writes diff chrome / banners / warnings to stderr. The pipe-
+  safety contract (P1-PIPE-09 — improved prompt to stdout, all else
+  to stderr) is enforced structurally by that one-place rule; a stray
+  print() without file=stderr in core/* would break a pipe-safety
+  test, not produce a silent bug.
+- Backend.name has TWO canonical forms. The full form
+  ("claude-cli (claude-sonnet-4-6)") is for human-readable display
+  (--status). The short form ("claude-cli" / "api-key") is what the
+  session schema, the index, the usage log, and the --output json
+  envelope use (P1-BKND-10). core/cli._short_backend_name() strips
+  the parens; do not store the full form in any persisted record.
+- Test fixtures that seed ~/.promptpal/ inside tmp_path MUST override
+  system_prompt_path in the config JSON to a tmp_path-relative path,
+  otherwise Config's default value of "~/.promptpal/system-prompt.md"
+  expands to the REAL $HOME at runtime and tests leak into the real
+  config dir. Burnt one US-011 iteration on this.
+- main() in core/cli.py accepts 14 injectable seam kwargs (config_path,
+  history_dir, usage_log_path, env, stdin/stdout/stderr,
+  detect_platform_fn, backend_factory, fetcher, clock, id_factory,
+  copy_fn, skip_wsl_guard). When extending the CLI in US-012+ keep
+  this seam set wide so integration tests stay filesystem-pure.
 
 ---
 
@@ -630,4 +654,54 @@ Started: 2026-05-18
     matches the coreutils convention. _parse_sidecar lowercases the input
     digest so an uppercase sidecar still verifies (defensive against
     Windows tooling that emits uppercase by default).
+---
+
+## 2026-05-19 13:50 - US-011
+- Implemented core/cli.py — the single orchestration layer for promptpal.
+- All PRD §5.4 flags wired via argparse → CLIOptions (frozen dataclass).
+- Early-exit commands: cmd_status, cmd_show_history, cmd_search, cmd_export,
+  cmd_update_system_prompt. Each is pure-functional with explicit
+  stdout/stderr/history_dir kwargs so tests don't touch sys globals.
+- _run_pipeline is the happy path: read_prompt → first turn → (--quiet
+  short-circuit OR run_refinement_loop) → fold turns into Session →
+  write_session + upsert_index_entry + append_usage_entry (all non-fatal
+  per P1-HIST-08) → enforce_max_entries → format_output → print to stdout.
+- _short_backend_name normalizes "claude-cli (claude-sonnet-4-6)" →
+  "claude-cli" for the session schema and the --output json envelope
+  (P1-BKND-10); cmd_status still uses the full name for display.
+- --uninstall and --replay are wired in the parser but exit 1 with
+  canonical "not implemented" messages — US-015 owns the real impl.
+- main() takes 14 injectable kwargs (config_path, history_dir,
+  usage_log_path, env, stdin/stdout/stderr, detect_platform_fn,
+  backend_factory, fetcher, clock, id_factory, copy_fn, skip_wsl_guard)
+  so the test suite exercises every branch without filesystem/network/
+  subprocess deps.
+- 77 new tests in tests/unit/test_cli.py; full project 497 tests green;
+  pyright clean; ruff clean; coverage 86% on core/cli.py (96% across core/).
+- Files changed: core/cli.py (new, 1199 lines), tests/unit/test_cli.py
+  (new, 1024 lines), ralph/prd.json (US-011 passes:true).
+- **Learnings for future iterations:**
+  - The CLI is the ONLY module that touches stdout for the improved
+    prompt; every helper writes diff/banner/warning to stderr. This
+    pipe-safety contract (P1-PIPE-09) is enforced structurally, not by
+    runtime checks — accidentally calling print() without file=stderr
+    in core/* would break a pipe-safety test, not produce a silent bug.
+  - When constructing a per-test ~/.promptpal/ fixture, set
+    `system_prompt_path` in the config JSON to a tmp_path-relative path,
+    otherwise `~` expansion uses real $HOME and test writes leak to the
+    real config dir. (Burnt one iteration on this.)
+  - The backend name has TWO canonical forms: the long form
+    ("claude-cli (claude-sonnet-4-6)") that Backend.name returns for
+    human-readable status display, and the short form
+    ("claude-cli" / "api-key") that the session schema and --output json
+    envelope use per P1-BKND-10. _short_backend_name strips the parens;
+    cmd_status keeps the full form.
+  - In --quiet mode, run_refinement_loop is bypassed entirely — the CLI
+    handles auto-iterations + auto-accept itself so the loop's stderr
+    chatter (choice prompt, raw prints) doesn't leak even if all I/O
+    seams are redirected. Keeps "stdout = improved prompt + newline"
+    structurally trivial.
+  - argparse SystemExit on invalid --output / --backend choices: tests
+    use pytest.raises(SystemExit) instead of asserting an error message
+    — argparse's error format is not what we pin.
 ---
