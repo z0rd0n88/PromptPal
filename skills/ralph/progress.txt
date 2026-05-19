@@ -1,0 +1,29 @@
+# Ralph Progress Log
+Started: Tue May 19 11:41:19 PDT 2026
+
+## Codebase Patterns
+- Test runner is `uv run --with pytest --with pyright pytest tests/` from the worktree root (no pyproject.toml; no venv on disk — uv resolves a one-off env each call).
+- Typecheck is `uv run --with pytest --with pyright pyright`. pyrightconfig.json sets typeCheckingMode=basic, pythonVersion=3.10, includes core/tests/conftest.py.
+- Coverage is `uv run --with pytest --with pytest-cov pytest --cov=core.<module>`.
+- Frozen dataclasses for immutable value types (Config exception aside — it must be mutable for `replace()`). Use `@dataclass(frozen=True)` and tuple fields, not list.
+- One module per concern under `core/`. Tests live at `tests/unit/test_<module>.py`; integration tests at `tests/integration/`.
+- Internal helpers prefixed `_` and exported via `from core.<mod> import _helper` for direct unit testing — preferred over heavy monkeypatching when the helper takes parameters that drive its decisions.
+- Canonical user-facing strings live as module-level constants (e.g. `WSL_LAUNCH_FIX_MESSAGE`, `NO_CLIPBOARD_WARNING`, `NoBackendError.MESSAGE`) and tests assert on substrings of them to catch silent drift.
+- File writes from PromptPal must use LF endings — `newline="\n"` on `open()` and `os.replace` for atomicity.
+- conftest.py at repo root prepends the repo root to sys.path so `from core.<mod> import ...` works without installing the package.
+
+---
+
+## 2026-05-19 - US-003 (core/platform.py)
+- Implemented `core/platform.py` with `Platform` (frozen dataclass), `detect_platform()`, `_detect_wsl()`, `_resolve_home()`, `_detect_clipboard()`, `assert_wsl_home_safe()`, `copy_to_clipboard()`, plus public constants `WSL_LAUNCH_FIX_MESSAGE`, `NO_CLIPBOARD_WARNING`, `OSRELEASE_PATH`.
+- Added `tests/unit/test_platform.py` — 33 tests, 100% line coverage of core/platform.py.
+- Files changed: `core/platform.py` (new), `tests/unit/test_platform.py` (new), `ralph/prd.json` (US-003 → passes:true with notes), `skills/ralph/progress.txt`.
+- **Learnings for future iterations:**
+  - `_detect_wsl` takes `osrelease_path` as a parameter so tests can write a temp file instead of monkeypatching `open`. Same pattern for `_resolve_home(env=...)` — passing dict-like env directly is cleaner than `monkeypatch.setenv`.
+  - For `copy_to_clipboard`, monkeypatch `subprocess.run` on the *module's* subprocess attribute (`platform_mod.subprocess.run`) — works because `import subprocess` gives the same module object globally and monkeypatch reverts on test exit.
+  - `clip.exe` UTF-8 no-BOM requirement (P1-PLAT-06 / D-9): Python's `str.encode("utf-8")` already omits the BOM — `"utf-8-sig"` would prepend one. Test asserts `not sent.startswith(b"\xef\xbb\xbf")` *and* round-trip decodes correctly.
+  - The HOME guard checks the **raw** `os.environ["HOME"]`, NOT the already-resolved `platform.home`. The point of the guard is to catch the regression even if `_resolve_home` already corrected it via passwd — so the user gets the relaunch message.
+  - Clipboard priority test must exercise the "all three Unix providers present" case to lock in *order* (not just "xclip works when alone"). Same for "xclip wins over clip.exe on WSL".
+  - `pwd` is a Linux/macOS stdlib module — pyright won't flag the import even though it's unavailable on Windows, because the tests run on WSL.
+  - PRD's `branchName: "ralph/phase-1-cli"` doesn't match the one-branch-per-story workflow already in use; previous stories (US-001, US-002) used `feat/us-XXX-*` branches and that pattern is continuing here.
+---

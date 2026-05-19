@@ -53,8 +53,8 @@
         "Tests pass"
       ],
       "priority": 3,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Implemented on branch feat/us-003-platform. Public surface: Platform (frozen dataclass: is_wsl, wsl_version, home, clipboard_cmd), detect_platform(), assert_wsl_home_safe(platform), copy_to_clipboard(text, platform) → bool, and constants WSL_LAUNCH_FIX_MESSAGE / NO_CLIPBOARD_WARNING / OSRELEASE_PATH the tests pin verbatim. Internal helpers _detect_wsl / _resolve_home / _detect_clipboard exposed for direct unit testing (each takes a parameter that makes the test inject inputs without monkeypatching globals). AC #1 _detect_wsl reads /proc/sys/kernel/osrelease lowercase; 'microsoft' → is_wsl=True; 'wsl2' substring → wsl_version=2 else 1; missing/unreadable → (False, None). AC #2 assert_wsl_home_safe checks the *raw* env HOME (not the already-resolved one) so the guard fires even when _resolve_home succeeded; prints WSL_LAUNCH_FIX_MESSAGE to stderr + sys.exit(1). AC #3 _resolve_home falls back to pwd.getpwuid(os.getuid()).pw_dir only when is_wsl and HOME starts with /mnt/c/ or /c/; KeyError on passwd lookup degrades gracefully to env HOME. AC #4 _detect_clipboard probes shutil.which in tuple-priority order xclip → xsel → pbcopy → clip.exe (gated on is_wsl) → (). AC #5 copy_to_clipboard sends text.encode('utf-8') — no BOM; verified for Greek/CJK/emoji round-trip in test_copy_to_clipboard_utf8_no_bom. AC #6 missing provider → exactly one stderr line NO_CLIPBOARD_WARNING; non-zero exit / OSError → stderr warn, return False, never raise. AC #7 regression test confirms save_config writes LF only. 33 new tests (81 total project tests); pytest green; pyright clean; 100% line coverage of core/platform.py."
     },
     {
       "id": "US-004",
