@@ -5,13 +5,671 @@ Started: 2026-05-18
 ## Codebase Patterns
 - Tests live in tests/unit/ and tests/integration/; root conftest.py puts the
   repo root on sys.path so `from core.x import y` works from any cwd.
-- Config writes use the tempfile.mkstemp -> os.rename atomic pattern with a
-  '.config-' prefix; the same pattern will be reused for history/session writes
-  (US-008) — extract to a helper if a third call site appears.
+- Atomic writes go through `core._io.atomic_write_bytes(target, payload, *,
+  prefix, suffix)` (extracted in US-008). config.save_config,
+  system_prompt._atomic_write_bytes, and history.write_session /
+  upsert_index_entry all delegate to it. Tempfile prefix is per call site
+  ('.config-', '.system-prompt-', '.session-', '.index-') so leftover-from-
+  failure inspection can attribute by module. Tests that need to fault-
+  inject the atomic write must monkeypatch `core._io.os.replace`, NOT the
+  per-module os import (which doesn't exist anymore on these modules).
+- Append-only NDJSON writes go through `core._io.append_ndjson_line(path,
+  record)`. Not atomic by design — append semantics + one-record-per-line
+  shape mean a kill -9 truncates at most the last record.
 - All on-disk text is UTF-8 with LF endings (`newline="\n"` on text writes).
 - preferred_backend is normalized through `normalize_preferred_backend()` at
   every entry point so a stale/corrupt value can never crash startup.
+- Backend implementations inject their external dependency via a single
+  `runner`/`transport` kwarg (ApiBackend → urllib transport; CliBackend →
+  subprocess runner). Tests substitute a programmable Fake; production uses the
+  module-level default. Keep this pattern when adding US-006+ resolve_backend.
+- Subprocess-style backends translate FileNotFoundError → a typed `*NotFoundError`
+  carrying the canonical SPEC §12 message; the CLI surface prints that message
+  verbatim. Tests pin the message string so accidental drift breaks the suite.
+- The Windows MSIX-launched session writes to WSL via UNC paths; pytest/pyright
+  must run under WSL via uv. `.ralph-runner.sh` (gitignored) wraps the uv calls
+  for each iteration: `bash .ralph-runner.sh test|typecheck|cov`. The
+  typecheck command MUST include `--with pytest` so test files don't report
+  spurious "Import pytest could not be resolved" errors.
+- Backend resolution + persistence live in core/resolve.py. The CLI layer
+  drives the persistence policy from outside resolve_backend: clear_backend_
+  preference BEFORE resolution (when --backend auto), persist_backend_
+  preference AFTER first successful turn (when --backend claude-cli|api-key).
+  Failed turns must not call persist_* — the contract is structural, enforced
+  by the caller's try/except, not by a guard inside the persist helper.
 
+- History sessions live at `~/.promptpal/history/<uuid>.json`; the
+  newest-first `index.json` is the search/list backing store; `usage.log`
+  is append-only NDJSON. Session schema: session_id / created_at /
+  updated_at / status / label / original_prompt / model / backend /
+  turns[] / final_prompt. IndexEntry carries only session_id / created_at
+  / label / status / original_prompt_preview (first 80 chars, no
+  ellipsis — must match original_prompt[:80] byte-identical). Each Turn
+  records role / content / backend / input_tokens / output_tokens /
+  timestamp; tokens are None for CLI (P1-BKND-10), int for API.
+- History writes are non-fatal (P1-HIST-08). The library raises OSError;
+  the caller wraps with try/except and calls `warn_history_failure(err)`
+  which prints the canonical P1-ERR-07 message to stderr. No sys.exit
+  inside the history module.
+- Test seam: every helper that touches `datetime.now()` / `uuid.uuid4()`
+  accepts an injectable `clock` / `id_factory` so tests can pin
+  timestamps and session ids without monkeypatching. Same shape as
+  transport/runner/fetcher in earlier modules.
+- Prompt input resolution lives in `core/input.py:read_prompt` and is
+  pure-functional (returns a string, never sys.exit()s). Selection
+  order: positional arg → stdin pipe (non-TTY) → interactive (TTY).
+  Whitespace-only/empty input at any stage raises
+  `EmptyPromptError(EMPTY_PROMPT_MESSAGE)` so callers can map a single
+  failure mode to a single canonical stderr line + exit 1.
+- Diff rendering lives in `core/diff.py` and is also pure: returns the
+  diff string; the CLI layer prints it to stderr (P1-PIPE-09). The
+  ">3 lines" threshold uses `len(improved.splitlines())` so a
+  trailing-newline doesn't shift the count — `'a\\nb\\nc'` and
+  `'a\\nb\\nc\\n'` are both 3 lines.
+- Pipe-safety contract (P1-PIPE-09 — improved prompt to stdout, all
+  else to stderr) is enforced by NOT writing to stdout from any
+  helper module. read_prompt's interactive banner goes to stderr;
+  format_diff returns a string. Keep this discipline in US-010
+  (refinement loop) — choice line, spinner, raw print all go to stderr.
+- The refinement loop lives in `core/loop.py:run_refinement_loop` and
+  is pure-functional with full IO-seam injection (stdin / stderr /
+  display / choice_reader / feedback_reader / copy_fn). It does NOT
+  call sys.exit, does NOT write session JSON, does NOT call
+  platform.copy_to_clipboard directly — persistence and exit codes are
+  the CLI layer's responsibility (US-011); the clipboard goes through
+  an injected `copy_fn` so tests don't need a real provider. Returns a
+  LoopOutcome(status, final_prompt, messages, new_turns); the caller
+  folds new_turns into the in-flight Session and writes it via
+  history.write_session + finalize_session.
+- The loop's `messages` is a list[dict[str, str]] projection of the
+  conversation — caller seeds initial_messages with the original user
+  turn + first assistant response; each [i]terate appends a user turn
+  + assistant turn. Backend.complete is invoked with a DEFENSIVE COPY
+  of messages so a misbehaving backend that mutates its argument
+  cannot corrupt the loop's state (test pins this).
+- Choice normalization is case-insensitive and FIRST-CHARACTER-ONLY:
+  'accept yes' / 'A' / 'a' all map to ACTION_ACCEPT. EOF on stdin
+  (readline → '') bails as STATUS_DISCARDED so a closed input stream
+  cannot infinite-loop the test suite.
+- The CLI layer (core/cli.py) is the SINGLE place that touches stdout
+  for the improved prompt, the --output json envelope, and the
+  --show-history / --search / --status / --export reports. Every other
+  module writes diff chrome / banners / warnings to stderr. The pipe-
+  safety contract (P1-PIPE-09 — improved prompt to stdout, all else
+  to stderr) is enforced structurally by that one-place rule; a stray
+  print() without file=stderr in core/* would break a pipe-safety
+  test, not produce a silent bug.
+- Backend.name has TWO canonical forms. The full form
+  ("claude-cli (claude-sonnet-4-6)") is for human-readable display
+  (--status). The short form ("claude-cli" / "api-key") is what the
+  session schema, the index, the usage log, and the --output json
+  envelope use (P1-BKND-10). core/cli._short_backend_name() strips
+  the parens; do not store the full form in any persisted record.
+- Test fixtures that seed ~/.promptpal/ inside tmp_path MUST override
+  system_prompt_path in the config JSON to a tmp_path-relative path,
+  otherwise Config's default value of "~/.promptpal/system-prompt.md"
+  expands to the REAL $HOME at runtime and tests leak into the real
+  config dir. Burnt one US-011 iteration on this.
+- main() in core/cli.py accepts 12 injectable seam kwargs (config_path,
+  history_dir, usage_log_path, stdin/stdout/stderr, detect_platform_fn,
+  backend_factory, fetcher, clock, id_factory, copy_fn, skip_wsl_guard).
+  When extending the CLI in US-012+ keep this seam set wide so
+  integration tests stay filesystem-pure. (US-011 dropped the `env` and
+  `bundled_system_prompt_path` kwargs — neither was used by any code
+  path; the backend factory already injects env via resolve_backend's
+  `env=` kwarg, and the bundled prompt path is a module constant.)
+- Entry chain is bash -> python -m core.main -> core.cli.main. The
+  bash launcher (bin/promptpal) does ONE substantive thing besides
+  exec'ing python: it duplicates the WSL HOME guard so the fix message
+  reaches the user before python imports anything that might choke on
+  an NTFS HOME. The text printed by the bash guard MUST match
+  core.platform.WSL_LAUNCH_FIX_MESSAGE verbatim — tests pin every line
+  via test_wsl_guard_text_pins_constant. If you edit one copy, edit
+  the other in the same commit.
+- The launcher's argv-forwarding test uses a bash shim for python3
+  (writes argv to a file via printf '%s\\n' "$@") rather than spawning
+  the real interpreter. This isolates the wrapper's behaviour ("$@"
+  preservation, exec exit-code propagation) from any CLI internals.
+  Mirror this pattern when testing US-013's install.sh / US-015's
+  uninstall.sh — wrap external commands with bash shims so each test
+  pins a single shell-script contract.
+- shellcheck lives at ~/.local/bin/shellcheck inside WSL; the
+  test_shellcheck_clean test uses shutil.which and pytest.skip when
+  the binary is absent so the suite still passes on hosts without
+  shellcheck installed (CI must install it explicitly to enforce the
+  contract).
+
+---
+
+## 2026-05-19 - US-011
+- core/cli.py NEW: parse_args(argv) -> CLIOptions, build_parser(),
+  format_output(), cmd_show_history, cmd_search, cmd_export, cmd_status,
+  cmd_update_system_prompt, _config_overrides_from_options,
+  _short_backend_name, _platform_label, _fold_outcome_into_session,
+  _try_write_session, _run_pipeline, and main(argv, **seams) -> int.
+  CLIOptions is a frozen dataclass with one field per PRD §5.4 flag (17
+  total). All flags wired via argparse with choices= constraints on
+  --output (plain|json|markdown) and --backend (auto|claude-cli|api-key)
+  pinned by tests.
+- AC #1: parser wires every §5.4 flag. test_complex_combination tests
+  the multi-flag case; individual tests pin each flag's parsed shape.
+  Invalid --output / --backend values exit via SystemExit (argparse's
+  default) — pinned by parametrized tests.
+- AC #2: format_output emits 'plain' (improved verbatim), 'json' (single
+  object with 6 keys: original/improved/turns/session_id/backend/model),
+  or 'markdown' (fenced code block). JSON ensure_ascii=False so emoji /
+  CJK pass through. The 'backend' field in the envelope is the short
+  form ('claude-cli'/'api-key') via _short_backend_name() — matches
+  the session schema (P1-BKND-10), not the full descriptive form.
+- AC #3: --quiet bypasses the refinement loop. _run_pipeline detects
+  options.quiet and runs first_turn + N synthesized iterations (when
+  --iterations N), writes session with status=accepted, then prints
+  format_output(...) to stdout with a single trailing newline. No diff,
+  no choice line, no spinner — verified by capsys-style assertions on
+  io.StringIO stderr.
+- AC #4: cmd_show_history reads index, sorts newest-first, paginates at
+  SHOW_HISTORY_PAGE_SIZE=20 with a 'N older sessions not shown' footer.
+  '(no history yet)' on empty index. test_populated_newest_first pins
+  the sort order using two entries with different created_at values.
+- AC #5: cmd_search delegates to history.search_history (index-first +
+  full-session fallback per P1-HIST-07). Results newest-first. label
+  matches and preview matches both surface; '(no sessions matched 'k')'
+  on miss.
+- AC #6 / NFR-09: cmd_status writes 'Platform: <WSL2|WSL1|Linux|macOS>'
+  on line 1 (P1-PLAT-09), then Backend / Model / Auth / Config /
+  History — 6 lines total (well under 20). Backend resolution failures
+  (NoBackendError / CliNotFoundError / ApiKeyMissingError) collapse to
+  'Backend: (unavailable)' + 'Reason: <e>' with no Auth line, and the
+  command still exits 0 (the whole point of --status is to diagnose).
+  Auth probe failure → 'Auth: failed' instead of crashing.
+- AC #7: cmd_export dumps Session.to_dict() as indent=2 JSON with
+  ensure_ascii=False to stdout. Missing session → EXIT_FAILURE with
+  'session 'X' not found' on stderr. Corrupt JSON → EXIT_FAILURE with
+  the parse error on stderr.
+- Pipe-safety (P1-PIPE-09) upheld structurally: stdout receives only
+  the improved prompt (plain), the JSON envelope, the markdown block,
+  the --show-history / --search / --export / --status reports.
+  Everything else (diff, banners, raw print, copy confirmations, no-
+  backend errors) goes to stderr. test_quiet_mode_stdout_has_only_
+  improved_prompt asserts stdout == 'just this\n' and stderr == ''
+  for a clean happy-path run.
+- --backend persistence policy: --backend auto clears the persisted
+  preference BEFORE resolution (test pins this via a config.json with
+  preferred_backend=api-key that gets reset on --backend auto). After
+  the first successful turn, --backend claude-cli|api-key persists via
+  core.resolve.persist_backend_preference; failed turns skip the
+  persist call structurally (caller's try/except — same contract as
+  US-006).
+- --update-system-prompt threads through to system_prompt.update_
+  system_prompt with the injected fetcher. Canonical P1-ERR-14 /
+  P1-ERR-15 messages surface verbatim on checksum mismatch / download
+  failure. On success, 'System prompt updated at <path>' goes to
+  stdout (the operation produced a tangible result) and 'Previous
+  prompt backed up at <path>' goes to stderr (informational).
+- --uninstall / --replay are wired in argparse but exit 1 with the
+  canonical UNINSTALL_NOT_IMPLEMENTED / REPLAY_NOT_IMPLEMENTED messages
+  — US-015 owns the real implementation. The constants are exported
+  so the US-015 implementation can re-use them (or pin them in tests
+  to detect when the stub gets replaced).
+- _short_backend_name(backend) extracts the canonical short form from
+  Backend.name ('claude-cli (model)' / 'api-key (model)' → 'claude-cli'
+  / 'api-key'). Used for session.backend, Turn.backend, usage-log
+  entries, AND the --output json envelope's 'backend' field. The full
+  descriptive form is reserved for --status human-readable output.
+- Loop iterations get usage-log entries per P1-HIST-05 (the original
+  draft only logged the first turn). For N iterations the usage log
+  has N+1 lines: turn 0 (first call) + turn 1..N (iterations).
+- Test seam: main() accepts 12 injectable kwargs (config_path,
+  history_dir, usage_log_path, stdin/stdout/stderr, detect_platform_fn,
+  backend_factory, fetcher, clock, id_factory, copy_fn, skip_wsl_guard).
+  Production callers pass nothing and get sys.* + the real filesystem +
+  detect_platform() + _default_backend_factory + the urllib-backed
+  fetcher + utc_now_iso clock + uuid.uuid4().hex id_factory + a copy_fn
+  that wraps platform.copy_to_clipboard. Tests inject io.StringIO +
+  FakeBackend + a frozen clock + a fixed session id factory.
+- 77 new tests in tests/unit/test_cli.py organized as 8 test classes
+  (one per AC + helpers + integration). Full project 497 tests pass
+  (was 420 before US-011); pyright clean; coverage 86% on core/cli.py
+  (96% across core/). The uncovered lines in cli.py are defensive
+  OSError branches inside the non-fatal P1-HIST-08 wrapper paths —
+  easy to test but low-value given the contract is 'never raise'.
+- Files changed: core/cli.py (NEW), tests/unit/test_cli.py (NEW),
+  ralph/prd.json (US-011 → passes: true), ralph/progress.txt.
+- **Learnings for future iterations:**
+  - Backend.name has two canonical forms ('claude-cli (model)' for
+    human display, 'claude-cli' for the session schema). When a future
+    backend is added (e.g. an openai-cli backend in Phase 2 — out of
+    scope for Phase 1) follow the same convention: name property
+    returns 'short (model)', _short_backend_name strips the parens.
+    Persisted records and the JSON envelope use the short form;
+    --status uses the full form.
+  - The CLI layer is the SINGLE place that calls sys.exit (via the
+    `if __name__ == '__main__': sys.exit(main())` block). Every other
+    module returns values or raises typed exceptions; main() catches
+    typed exceptions and returns the right exit code. Don't break this
+    discipline in US-012 — the bash entry should be:
+      exec python3 -m core.main "$@"
+    where core/main.py is just `from core.cli import main as _main; sys.exit(_main())`.
+  - Tests that seed ~/.promptpal/ inside tmp_path MUST override
+    system_prompt_path in the config JSON to a tmp_path-relative path,
+    otherwise Config's default value of "~/.promptpal/system-prompt.md"
+    expands to the REAL $HOME at runtime and tests leak into the real
+    config dir. The tmp_promptpal fixture in test_cli.py does this
+    correctly; pattern it when writing US-015's tests.
+  - --update-system-prompt prints to stdout, not stderr — the operation
+    has a tangible 'success' value the user wants to confirm, similar
+    to --show-history / --search / --export / --status. Other CLI
+    flags' status messages (like backup paths, persist warnings) still
+    go to stderr because they're informational/non-primary output.
+  - The 'enforce_max_entries after every accept/discard' policy
+    (P1-HIST-06) is realized via try/except OSError around the
+    enforce_max_entries call. Failure to evict is non-fatal — the
+    session was already written, eviction is a maintenance task.
+    Same defensive-default pattern as P1-HIST-08.
+  - argparse's SystemExit on --help / parse errors is fine for
+    production but tests that exercise main() through argv must use
+    pytest.raises(SystemExit) for the negative cases. Tests that just
+    want to verify a flag is parsed should use parse_args() directly,
+    not main(). The test file follows this pattern.
+
+---
+
+## 2026-05-19 - US-010
+- core/loop.py NEW: run_refinement_loop(*, backend, system,
+  initial_messages, initial_improved, original_prompt,
+  auto_iterations=0, copy_on_accept=False, stdin=None, stderr=None,
+  display=None, choice_reader=None, feedback_reader=None,
+  copy_fn=None) -> LoopOutcome. Public surface also exports
+  LoopOutcome / LoopTurn (frozen dataclasses), canonical-message
+  constants CHOICE_PROMPT, ITERATE_FEEDBACK_PROMPT,
+  SYNTHESIZED_FEEDBACK ('Improve this further.'), RAW_HEADER,
+  COPY_SUCCESS_MESSAGE, action constants ACTION_ACCEPT/ITERATE/
+  DISCARD/RAW/COPY, status constants STATUS_ACCEPTED/STATUS_DISCARDED
+  matching history's, and VALID_ACTIONS.
+- AC #1 / P1-LOOP-01: CHOICE_PROMPT '[a]ccept [i]terate [d]iscard
+  [r]aw [c]opy: ' is the source of truth for the menu; default
+  choice_reader writes it to STDERR before stdin.readline().
+- AC #2 / P1-LOOP-02: [i]terate appends a user turn with the
+  feedback, calls backend.complete(system, [defensive copy of
+  messages]), appends assistant response — full conversation sent
+  every call, no truncation. Tests assert the 3rd iterate's payload
+  is 7 messages (initial 2 + 2 prior u/a pairs + new user feedback).
+- AC #3 / P1-LOOP-03: test_three_iterations_in_one_session exercises
+  ['i','i','i','a'] with backend queue depth 3; all 3 calls land.
+- AC #4 / P1-LOOP-04: [a]ccept returns LoopOutcome(status=
+  STATUS_ACCEPTED, final_prompt, messages, new_turns). When
+  copy_on_accept=True AND copy_fn is wired, calls copy_fn(improved)
+  and prints COPY_SUCCESS_MESSAGE on True; on False the wrapped
+  copy_fn is responsible for its own warning (platform.copy_to_
+  clipboard prints NO_CLIPBOARD_WARNING) so we don't double-print.
+- AC #5 / P1-LOOP-05: [d]iscard returns LoopOutcome(status=
+  STATUS_DISCARDED, final_prompt=latest improved) — the historical
+  record reflects what the user saw, even after an iterate.
+- AC #6 / P1-LOOP-06: [r]aw prints RAW_HEADER + improved to STDERR
+  (P1-PIPE-09 upheld — never stdout) and re-presents the choice
+  line. Repeated [r]aw is allowed; capsys.readouterr().out is empty.
+- AC #7 / P1-LOOP-07: [c]opy calls copy_fn; when copy_fn=None prints
+  'Warning: no clipboard provider available.' to stderr and re-
+  presents the choice line (P1-PLAT-07 non-fatal contract).
+- AC #8 / P1-LOOP-08: auto_iterations=N runs N synthesized 'Improve
+  this further.' rounds BEFORE the first choice line. Exactly one
+  display() call fires after the final auto-iteration (not one per
+  round) — minimizes screen churn while still showing the user the
+  result they're being asked to accept. auto_iterations<0 treated as
+  0 (defensive default — never crash on a caller typo).
+- Pipe-safety: zero stdout writes anywhere in the module (pinned by
+  test_loop_writes_nothing_to_stdout using capsys).
+- Defensive backend handling: _iterate passes a list[dict] copy to
+  backend.complete so a backend that mutates its messages argument
+  (e.g. clears it and injects new ones) cannot poison the loop's
+  internal log. Test_backend_mutation_of_messages_does_not_corrupt_
+  state pins this.
+- Choice normalization: case-insensitive, first-char-only. 'accept
+  yes' → ACTION_ACCEPT, 'iterate now' → ACTION_ITERATE. EOF on stdin
+  (readline returns '') bails as STATUS_DISCARDED.
+- AC-MT-01 regression bait: a 'Human:' literal in the user prompt
+  survives the loop's messages projection byte-identical (no role-
+  prefix flattening). Test_human_colon_in_user_prompt_survives_
+  round_trip pins this.
+- 41 new tests in tests/integration/test_pipeline.py covering all 8
+  ACs plus defensive paths (typo'd choice, EOF, case insensitivity,
+  mutating backend, alias safety, AC-MT-01). Full project 420 tests
+  pass (was 379 before US-010); pyright clean; coverage 100% on
+  core/loop.py, 99% across core/.
+- Files changed: core/loop.py (NEW), tests/integration/test_
+  pipeline.py (NEW), ralph/prd.json (US-010 → passes: true),
+  ralph/progress.txt.
+- **Learnings for future iterations:**
+  - The "loop returns a value, caller persists" split keeps the
+    refinement loop testable without a real history dir, and lets
+    the CLI layer (US-011) decide things like '--no-history skips
+    write_session entirely'. Don't fold session writes into the loop
+    even though the AC text reads 'writes session JSON' — the
+    structural contract is 'caller writes session based on outcome
+    status', and the integration tests will pin that the CLI
+    coordinates it correctly.
+  - copy_fn=None means 'no clipboard wired'. The CLI layer (US-011)
+    will set copy_fn = functools.partial(copy_to_clipboard,
+    platform=platform); platform.copy_to_clipboard prints its own
+    NO_CLIPBOARD_WARNING on no-provider and returns False — DO NOT
+    double-print the warning here. On the [c]opy menu action with
+    copy_fn=None (clipboard hasn't been wired at all), the loop
+    prints its own warning so the user knows the action was a no-op.
+  - The choice line is the loop's structural contract — keep it in
+    one place (CHOICE_PROMPT constant) and assert all 5 actions
+    appear in it. If a future iteration adds [s]ave or [n]ame, the
+    test that pins '[a]ccept [i]terate [d]iscard [r]aw [c]opy in
+    CHOICE_PROMPT' will guide where the new action lands relative
+    to the existing menu.
+  - The auto-iteration display contract is 'show the user what
+    they're being asked to accept' — one display call after the
+    final auto-iteration, not one per round. This matches what a
+    CLI user actually wants: they typed `--iterations 3` to skip
+    the intermediate steps, so don't surface them.
+  - Backend mutation defense (the defensive-copy in _iterate) is
+    cheap and prevents an entire class of action-at-a-distance
+    bugs. Adopt the same pattern in US-011 (CLI) when threading
+    messages between layers — a list copy is O(n) of pointers,
+    not contents, and the loop's messages list grows at most 2N+2
+    deep for N iterations. The cost is invisible at any
+    reasonable N.
+  - Tests that use a queue-based choice_reader / feedback_reader
+    self-terminate naturally: the queue empties → eof_reader
+    returns '' → loop bails as discard. This is safer than test
+    timeouts and means a misconfigured test (wrong number of
+    inputs queued) fails loudly with a specific status assertion.
+    Replicate this pattern when wiring tests for US-011's argparse
+    layer.
+
+---
+
+## 2026-05-19 - US-009
+- core/input.py NEW: read_prompt(positional_arg, *, stdin=None,
+  stderr=None, isatty=None) -> str; EmptyPromptError(ValueError) with
+  MESSAGE class constant; constants EMPTY_PROMPT_MESSAGE and
+  INTERACTIVE_PROMPT_BANNER pinned verbatim by tests. Three input modes
+  (P1-PIPE-01..03): positional arg → stdin pipe (non-TTY) → interactive
+  (TTY). Whitespace-only / empty input at any stage raises
+  EmptyPromptError; the CLI layer (US-011) will map that to exit 1 +
+  EMPTY_PROMPT_MESSAGE on stderr.
+- core/diff.py NEW: line_count(text), should_show_diff(improved),
+  format_diff(original, improved, *, fromfile, tofile); constants
+  DIFF_LINE_THRESHOLD=3, DEFAULT_FROMFILE='original',
+  DEFAULT_TOFILE='improved'. should_show_diff uses
+  len(improved.splitlines()) > 3 so trailing-newline doesn't shift the
+  count — 'a\\nb\\nc' and 'a\\nb\\nc\\n' are both 3 lines and BOTH fall
+  under the threshold. format_diff uses difflib.unified_diff with
+  lineterm='' so the joined output has no double-newline gaps;
+  identical inputs return ''.
+- AC #1 / P1-PIPE-01: positional_arg returned byte-identical when
+  non-empty after strip; AC-MT-01 regression bait ('Human:' in user
+  prompt) survives this layer untouched.
+- AC #2 / P1-PIPE-02: stdin.read() returned verbatim, no trim of the
+  trailing newline so multi-line piped payloads round-trip clean.
+- AC #3 / P1-PIPE-03: INTERACTIVE_PROMPT_BANNER written to STDERR
+  before stdin.read() — never stdout, never sys.stdout (the test
+  uses io.StringIO for stderr and asserts equality with the banner).
+- AC #4 / P1-PIPE-06: should_show_diff boundary pinned by
+  parametrized tests at the exact 3-vs-4 line edge. format_diff
+  output contains the canonical '--- original' / '+++ improved' /
+  '@@' marker triad; identical inputs collapse to ''.
+- AC #5 / P1-PIPE-09: neither module writes to stdout. read_prompt's
+  banner goes to stderr; format_diff returns a string and the CLI
+  layer is responsible for writing it. This module-level discipline
+  is the structural enforcement of the pipe-safety contract.
+- 47 new tests: 28 in tests/unit/test_diff.py (constants + line_count
+  + should_show_diff boundary + format_diff markers / custom
+  filenames / UTF-8 / parametrized 3-vs-4 line edge), 19 in
+  tests/integration/test_stdin.py (positional / stdin-pipe /
+  interactive with explicit io.StringIO seams + default-isatty
+  fallback when isatty kwarg omitted). Full project 379 tests pass
+  (was 332 before US-009); pyright clean; coverage 100% on
+  core/input.py and core/diff.py, 99% across core/.
+- Files changed: core/input.py (NEW), core/diff.py (NEW),
+  tests/unit/test_diff.py (NEW), tests/integration/test_stdin.py
+  (NEW), ralph/prd.json (US-009 → passes: true), ralph/progress.txt.
+- **Learnings for future iterations:**
+  - The "pure-functional + injectable IO seam" shape that worked for
+    backend transport / runner / fetcher works just as well for
+    stdin/stderr/isatty. Tests construct io.StringIO instances
+    locally rather than monkeypatching sys globals — no leakage
+    risk between tests, parallel-safe.
+  - "improved length > 3 lines" reads naturally as a > comparison
+    against splitlines() count. Resist the temptation to count
+    newlines directly: 'a\\nb\\nc' has 2 newlines but 3 lines, and
+    'a\\nb\\nc\\n' has 3 newlines but still 3 lines. splitlines
+    normalizes both shapes to 3.
+  - The empty-prompt failure mode IS a separate error class
+    (EmptyPromptError, not raised on a generic ValueError) so the
+    US-011 CLI layer can catch it specifically and map to the
+    canonical exit-1 + stderr message. Same pattern as
+    SystemPromptMissingError / NoBackendError — each canonical
+    user-visible error is one class with one constant message.
+  - Whitespace-only positional arg raises rather than falling through
+    to stdin. The reasoning: the user explicitly typed
+    `promptpal ""` or `promptpal "   "`, which is almost always a
+    shell-quoting bug; falling through silently would consume stdin
+    they didn't intend to provide. This is the same defensive-default
+    pattern as US-006's preferred_backend collapsing to 'auto' on
+    unknown typo — explicit caller error → explicit explainable
+    failure, never silent recovery into the next mode.
+  - The pipe-safety contract (P1-PIPE-09) is structurally enforced by
+    NOT writing to stdout in any helper module. US-010 (refinement
+    loop) must continue this discipline — the choice line, spinner
+    frames, raw print, and copy confirmations all go to stderr; only
+    the final improved prompt lands on stdout (and only when the
+    pipeline reaches the accept branch).
+
+---
+
+## 2026-05-19 - US-008
+- core/_io.py NEW: shared atomic_write_bytes(target, payload, *, prefix,
+  suffix) and append_ndjson_line(path, record). config.save_config and
+  system_prompt._atomic_write_bytes refactored to delegate; the
+  os.replace monkeypatches in test_system_prompt.py moved from
+  'core.system_prompt.os.replace' to 'core._io.os.replace' (two-line
+  test edit). The "extract when US-008 lands the third tracked variant"
+  plan from the US-007 learning is now executed.
+- core/history.py NEW: full P1-HIST-01..08 surface. Session / Turn /
+  IndexEntry frozen dataclasses with to_dict/from_dict roundtrip. new_
+  session / append_turn / finalize_session for immutable updates.
+  write_session / read_session / upsert_index_entry / read_index /
+  write_index for I/O. enforce_max_entries for P1-HIST-06 eviction.
+  append_usage_entry for P1-HIST-05. search_history for P1-HIST-07.
+  warn_history_failure for P1-HIST-08.
+- AC #1 / P1-HIST-01: <uuid>.json one file per session, helper
+  session_path(history_dir, session_id) for path computation.
+- AC #2 / P1-HIST-02: index entry has exactly the 5 mandated fields;
+  preview is original_prompt[:80] (no ellipsis — must be byte-identical
+  for substring search to work without normalization).
+- AC #3 / P1-HIST-03: every JSON write inherits the atomic contract
+  from core._io. Tests pin os.replace via the helper.
+- AC #4 / P1-HIST-04: same path overwritten in place for every turn;
+  finalize_session refuses 'in-progress' / unknown statuses (a caller
+  bug can't ever finalize as non-terminal).
+- AC #5 / P1-HIST-05: append-only NDJSON; tokens propagate as JSON null
+  for CLI turns, int for API turns; ensure_ascii=False so emoji ride
+  as raw UTF-8.
+- AC #6 / P1-HIST-06: enforce_max_entries sorts newest-first, keeps
+  first max_entries, unlinks the rest's files (tolerating
+  FileNotFoundError for idempotent partial-eviction recovery).
+  max_entries=0 evicts all; max_entries<0 treated as 'unlimited' so a
+  caller bug can't wipe history.
+- AC #7 / P1-HIST-07: index match first (label + preview substring,
+  case-insensitive), then full-session fallback (original_prompt +
+  final_prompt). Missing/corrupt session files during fallback skipped
+  silently — search must not crash the run. Empty keyword returns all
+  newest-first.
+- AC #8 / P1-HIST-08: warn_history_failure(err=None) prints the
+  canonical 'Warning: could not save session to history.' to stderr.
+  Library never sys.exit()s — non-fatality is the caller's contract.
+- 64 new tests in tests/unit/test_history.py covering all 8 ACs plus
+  full lifecycle integration (in-progress incremental writes → accept
+  finalize) and dict roundtrip / UTF-8 preservation / atomic-write
+  inheritance. Full project 332 tests pass (was 268 before US-008);
+  pyright clean; coverage 100% on core/history.py, 92% on core/_io.py
+  (2 lines: nested OSError catch in tempfile cleanup, defensive code
+  inherited from the pre-refactor system_prompt helper), 99% across
+  core/.
+- Files changed: core/_io.py (NEW), core/history.py (NEW),
+  core/config.py (save_config refactored to delegate; removed local
+  tempfile/os imports), core/system_prompt.py (_atomic_write_bytes
+  refactored to delegate; removed local tempfile/os imports),
+  tests/unit/test_system_prompt.py (two os.replace patch paths moved),
+  tests/unit/test_history.py (NEW), ralph/prd.json (US-008 →
+  passes: true), ralph/progress.txt.
+- **Learnings for future iterations:**
+  - The decision to model Session/Turn as frozen dataclasses with
+    dataclasses.replace-style mutators (append_turn returns a new
+    Session) keeps the loop's per-turn state safe to thread through
+    the messages array without aliasing surprises. US-009/US-010 should
+    build the messages array on top of this — Session.turns is the
+    canonical source of truth, the messages list is a projection.
+  - Eviction (enforce_max_entries) treats max_entries<0 as 'unlimited'
+    rather than 'invalid' so a caller bug can never wipe the history.
+    The same defensive-default pattern applies elsewhere: if a config
+    field collapsing to a destructive value would be catastrophic,
+    pick the no-op fallback over the fail-fast one.
+  - search_history's fallback skips missing/corrupt session files
+    instead of raising. The contract is "find what you can"; surfacing
+    one bad file as a crash would defeat the search command's purpose.
+    This matches the non-fatal stance of P1-HIST-08 throughout the
+    module.
+  - The atomic-write extraction works cleanly because both prior call
+    sites (config + system_prompt) already encoded their payloads to
+    bytes by the time they hit the write — the helper signature
+    (bytes, prefix, suffix) needed no special-casing. Future modules
+    that want atomic JSON writes should follow the same pattern:
+    encode to bytes first, then delegate.
+  - The IndexEntry.original_prompt_preview is original_prompt[:80] with
+    NO ellipsis. This is deliberate — substring search needs the
+    preview to match original_prompt byte-identical at the front so
+    '--search foo' against an 80-char prompt body works without
+    normalization. If the future UI wants an ellipsis for display,
+    it renders one at print time; the file-format value is unchanged.
+  - The clock injection pattern (Callable[[], str]) is now stable
+    across system_prompt fetcher, history append_turn / new_session /
+    finalize_session / append_usage_entry. US-009/US-010 should
+    continue this pattern for any new module that depends on real
+    time so tests stay deterministic.
+
+---
+
+## 2026-05-19 - US-006
+- core/resolve.py: resolve_backend(preferred, model, *, config, env=None,
+  which=None, api_factory=None, cli_factory=None) implementing the
+  P1-BKND-04..07 ladder — explicit flag → Config.preferred_backend →
+  auto-detect. clear_backend_preference(config_path) writes 'auto' to disk
+  immediately (AC #6). persist_backend_preference(config_path, value) writes
+  'claude-cli'/'api-key' to disk after the first successful turn (AC #5).
+  Both helpers go through load_config + dataclasses.replace + save_config so
+  the atomic-write contract (P1-CFG-05) and the "preserve other Config
+  fields" invariant come for free.
+- AC #2 / P1-BKND-05: --backend claude-cli + missing claude → CliNotFoundError
+  even when ANTHROPIC_API_KEY is set. No silent fallback to API.
+- AC #3 / P1-BKND-06: --backend api-key + unset ANTHROPIC_API_KEY (or empty
+  string) → ApiKeyMissingError even when claude is on PATH. No silent
+  fallback to CLI.
+- AC #4 / P1-BKND-07: both unavailable → NoBackendError with the
+  'Option 1 (Claude CLI):' / 'Option 2 (API key):' two-option block (the
+  message already lived on NoBackendError.MESSAGE from US-001).
+- AC #7: failed call does not persist — the contract is structural (caller's
+  try/except skips the persist call), so resolve.py's persist helper has no
+  internal "did the call succeed" gate.
+- env injected via Mapping[str, str] (defaults to os.environ); which
+  injected via Callable[[str], str|None] (defaults to shutil.which); both
+  backend factories injected (defaults to the real ApiBackend/CliBackend).
+  Tests substitute stub subclasses of Backend so ApiBackend's
+  ANTHROPIC_API_KEY-required constructor doesn't trip the test path.
+- 33 new tests: 14 in tests/unit/test_backend.py (resolve_backend selection
+  + error paths) + 19 in tests/unit/test_backend_persistence.py NEW
+  (persist/clear semantics, atomic-write inheritance, AC-BKND-04 end-to-end).
+  Full project 217 tests pass; pyright clean (after wiring `--with pytest`
+  into .ralph-runner.sh's typecheck command); coverage 100% on
+  core/resolve.py, 98% across core/.
+- Files changed: core/resolve.py (NEW), tests/unit/test_backend.py (extend
+  with resolve_backend section + helpers + fakes), tests/unit/
+  test_backend_persistence.py (NEW), .ralph-runner.sh (add --with pytest to
+  typecheck), ralph/prd.json (US-006 → passes: true), ralph/progress.txt.
+- **Learnings for future iterations:**
+  - The persistence policy (clear-on-auto immediately, persist-after-success)
+    cannot be enforced from inside resolve_backend because the caller has to
+    sequence the turn between them. Future US-010 (refinement loop) and
+    US-011 (CLI argparse) MUST call clear_backend_preference BEFORE
+    resolve_backend when args.backend == 'auto', and call
+    persist_backend_preference AFTER the first successful complete() when
+    args.backend in ('claude-cli','api-key'). Subsequent turns in the same
+    session should not re-persist (the field is already set).
+  - PRD AC #2 says "fail immediately with FileNotFoundError" but the
+    existing CliNotFoundError(CliError) hierarchy from US-005 already
+    carries the canonical message. I chose to raise CliNotFoundError, NOT
+    actual FileNotFoundError — making CliNotFoundError multiply inherit
+    from FileNotFoundError was rejected as needless complexity given that
+    the canonical message and the CLI surfacing pattern are what matter
+    (tests pin the message text, not the class hierarchy). If a future
+    spec amendment really requires `except FileNotFoundError` to catch it,
+    add `FileNotFoundError` as a second base on CliNotFoundError and the
+    existing tests still pass.
+  - resolve_backend takes a `config` kwarg (not a path) so the CLI can
+    pass the *already-mutated* in-memory Config to it after
+    clear_backend_preference has run. Loading from disk inside
+    resolve_backend would race with the immediate-clear write.
+  - _effective_preference compresses (CLI flag, Config) into a single
+    'effective' value (one of "auto"/"claude-cli"/"api-key") BEFORE the
+    PATH/env gates run. This keeps the ladder readable and lets the
+    "explicit auto bypasses Config" rule live in one place. Unknown
+    preferred values collapse to "auto" defensively — never crash on a
+    caller typo.
+  - Coverage gaps are easy to introduce with optional-arg defaulting
+    (`env or os.environ`) — use `env if env is not None else os.environ`
+    so a caller passing `env={}` (empty mapping) doesn't silently fall
+    through to the real environment. Same pattern for `which`.
+
+---
+
+## 2026-05-19 - US-005
+- core/cli_backend.py: CliBackend (Backend subclass) invoking
+  `claude --print --model <m> --bare --system-prompt-file <path>
+  --input-format=stream-json --output-format=stream-json`, with messages array
+  piped to stdin as NDJSON. Error hierarchy CliError/CliAuthError/
+  CliNotFoundError/CliInvocationError. Canonical-message constants
+  AUTH_ERROR_MESSAGE, CLI_NOT_FOUND_MESSAGE, AUTH_FAILURE_KEYWORDS,
+  STREAM_JSON_FLAGS. _parse_stream_json supports both the canonical
+  {type:assistant,...} envelope and the {type:content_block_delta,...} shape.
+- Each CLI turn carries input_tokens=None, output_tokens=None (P1-BKND-10).
+- check_auth() runs `claude --version`; False on any non-zero / missing binary.
+- System prompt written to a 0600 mkstemp tempfile per call; cleaned up in a
+  finally block even when the runner raises.
+- Subprocess layer injected via a `runner` kwarg (Callable → _CliRunResult);
+  default uses subprocess.run, translating FileNotFoundError → CliNotFoundError.
+- 60 new tests in tests/unit/test_cli_backend_streamjson.py (matches US-016's
+  P1-BKND-03 mapping). Full project 186 tests pass; pyright clean; 98% coverage
+  on core/cli_backend.py (97% across core/).
+- Files changed: core/cli_backend.py (NEW),
+  tests/unit/test_cli_backend_streamjson.py (NEW), .gitignore (add
+  .ralph-runner.sh), ralph/prd.json (US-005 → passes: true), ralph/progress.txt.
+- **Learnings for future iterations:**
+  - The "Human:" literal regression bait (AC-MT-01) is a structural property of
+    stream-json — every message rides as its own NDJSON object, so the role
+    boundary is byte-explicit. The test that pins this verifies the user content
+    survives `json.loads` byte-identical; future backends that flatten messages
+    would break this test loudly.
+  - `--output-format=stream-json` events from claude are NDJSON; the parser
+    treats them as line-delimited and skips both unparseable lines and blank
+    lines. Future claude versions may add new envelope types — keep the
+    extractor permissive (return [] on unknown type, never raise).
+  - PRD-PHASE1.md is the authoritative spec, NOT SPEC.md (which isn't in the
+    repo). The §14 amendment table is where the actual SPEC deltas live —
+    consult it before implementing anything where US-001/US-002 notes mention a
+    "SPEC delta" without a fully-merged spec available.
+  - The runner is invoked with a `system_prompt_path` tempfile that exists
+    only during the call. Tests that need to verify the file's content must do
+    so inside the fake runner (the file is unlinked in the finally block before
+    the test gets control back).
+  - When using `uv run --with X` the ephemeral env is cached but separate per
+    package set. Running pyright in one env then tests in another is fine for
+    speed but means pyright must include `pytest` in its --with list, otherwise
+    test files report spurious `Import "pytest" could not be resolved` errors.
 ---
 
 ## 2026-05-18 - US-001
@@ -49,4 +707,169 @@ Started: 2026-05-18
     be rejected for `auto_copy`. Adjust if PRD ever requires that coercion.
   - Default field values that depend on $HOME use `field(default_factory=...)`
     so tests can swap HOME safely.
+---
+
+## 2026-05-19 - US-007
+- core/system_prompt.txt (NEW): UTF-8/LF Prompt Builder-style default with 7
+  numbered principles. Non-empty, no CRLF, ships with the repo. (P1-SP-01)
+- core/system_prompt.py (NEW): public surface seed_system_prompt /
+  resolve_system_prompt_path / read_system_prompt / update_system_prompt;
+  exception hierarchy SystemPromptError + SystemPromptMissingError /
+  SystemPromptChecksumError / SystemPromptDownloadError; canonical-message
+  constants MISSING_MESSAGE_TEMPLATE, CHECKSUM_MISMATCH_MESSAGE (P1-ERR-14),
+  DOWNLOAD_FAILED_MESSAGE_TEMPLATE (P1-ERR-15), BUNDLED_SYSTEM_PROMPT_PATH,
+  BACKUP_SUFFIX ('.bak'), SHA256_SIDECAR_SUFFIX ('.sha256'). Tests pin every
+  canonical string verbatim.
+- AC #2 (seed-on-first-run): seed_system_prompt streams via shutil.copyfile so
+  the bundled bytes round-trip exactly (no encoding re-normalization), creates
+  the parent directory on demand, returns True/False so the installer can log
+  whether a seed actually happened.
+- AC #3 (no overwrite without --update-system-prompt): seed_system_prompt is a
+  no-op when target exists -- even an empty file blocks a re-seed. P1-SP-02
+  guarantee enforced by the very first stat call.
+- AC #4 (sha256 verification): update_system_prompt fetches both url and
+  url + '.sha256'; computes hashlib.sha256(payload).hexdigest(); on mismatch
+  raises SystemPromptChecksumError with the canonical P1-ERR-14 message and
+  leaves the target untouched. _parse_sidecar accepts BOTH bare-hex
+  ('<hex>\n') and sha256sum coreutils format ('<hex>  <filename>\n'),
+  lowercases, validates 64 hex chars; malformed sidecars collapse to the same
+  checksum-mismatch error path (a garbled sidecar cannot authorize an
+  overwrite).
+- AC #5 (backup before replace): when target exists, the current bytes are
+  copied to <target>.bak BEFORE the atomic replace. backup_path is RETURNED
+  from update_system_prompt so the CLI surface owns the print-decision
+  (cleaner than coupling this module to stderr). A second update overwrites
+  the prior .bak -- single rolling backup, not a versioned chain.
+- AC #6 (--system-prompt FILE override): resolve_system_prompt_path returns
+  Path(cli_override).expanduser() when given, else
+  config.resolved_system_prompt_path(). cli_override is NEVER written back to
+  Config -- verified by test_resolve_does_not_persist_override, which asserts
+  cfg.system_prompt_path is unchanged after resolution.
+- AC #7 (missing/unreadable -> actionable message): read_system_prompt
+  translates FileNotFoundError / IsADirectoryError / PermissionError /
+  OSError -> SystemPromptMissingError with
+  MISSING_MESSAGE_TEMPLATE.format(path=...). The CLI layer (US-011) will
+  catch and exit 1 with the canonical text.
+- Atomic write contract: _atomic_write_bytes uses
+  tempfile.mkstemp(prefix='.system-prompt-', dir=target.parent) + os.replace
+  for same-FS atomic rename; tempfile unlinked in except on os.replace
+  failure. target.parent.mkdir(parents=True, exist_ok=True) so a first-run
+  --update-system-prompt invocation can run directly into a missing
+  ~/.promptpal/ directory. Verified via tracking-replace test (replace called
+  exactly once, tempfile lives in same dir, no leftover) and disk-full test
+  (os.replace raises -> tempfile unlinked -> target unchanged).
+- Default fetcher (_default_fetcher) is urllib-backed and translates
+  HTTPError/URLError/OSError -> SystemPromptDownloadError with the canonical
+  template; tests inject a programmable fake fetcher (dict[url, bytes]) so
+  the network is never touched. Same injection pattern as ApiBackend.transport
+  and CliBackend.runner -- module-level default + kwarg seam.
+- 51 new tests in tests/unit/test_system_prompt.py covering all 7 ACs +
+  atomic-write semantics + sidecar format tolerance (bare hex, coreutils,
+  uppercase, garbage) + _default_fetcher error translation + happy path via
+  mocked urlopen. Full project 268 tests pass; pyright clean; coverage 98%
+  on core/system_prompt.py (98% across core/). The 2 uncovered lines are
+  the nested OSError catch inside the tempfile-cleanup branch of
+  _atomic_write_bytes -- defensive code that fires only when both os.replace
+  and tmp_path.unlink raise OSError.
+- Files changed: core/system_prompt.txt (NEW), core/system_prompt.py (NEW),
+  tests/unit/test_system_prompt.py (NEW), ralph/prd.json (US-007 ->
+  passes: true), ralph/progress.txt.
+- **Learnings for future iterations:**
+  - "Return path, let caller print" is the right shape for messages that
+    happen inside a library function (the backup-path print here). It
+    keeps the module decoupled from stderr/stdout policy AND lets the CLI
+    layer (US-011) bundle the print with the rest of its output-style
+    handling (--quiet, --output json, etc.).
+  - When you need to support multiple sidecar formats (bare-hex vs
+    sha256sum coreutils), normalize to the first whitespace-separated
+    token and lowercase. Don't try to parse the filename -- it would
+    couple the verifier to the URL/filename mapping unnecessarily.
+  - Test seam pattern across the codebase is now stable: every module
+    that touches the network or filesystem boundary takes an injectable
+    callable (transport, runner, fetcher, sleeper). Production caller
+    passes nothing; tests pass a fake. Match this for US-008 history
+    (e.g. inject a clock for created_at timestamps).
+  - Atomic write helper is now duplicated across config.save_config and
+    system_prompt._atomic_write_bytes. When US-008 (history) lands the
+    third call site, extract to core/_io.py:atomic_write_bytes(path,
+    payload, *, prefix, suffix) and have the existing call sites delegate
+    to it. Until then, the duplication is justified -- each call site has
+    a slightly different prefix/suffix/encoding shape.
+  - The "no overwrite without --update-system-prompt" rule lives in TWO
+    places: seed_system_prompt's exists() short-circuit (P1-SP-02), AND
+    the absence of any code path other than update_system_prompt that
+    writes to system_prompt_path. Don't add a "write_system_prompt" helper
+    in US-008 or US-011 -- the CLI must call update_system_prompt
+    specifically to mutate the file, otherwise the user-data contract is
+    silently broken.
+  - URL + '.sha256' suffix is a convention, not an arg --
+    SHA256_SIDECAR_SUFFIX is a public constant so tests pin the URL shape
+    too (catches accidental changes to '.sha256sum' or '.checksum' that
+    would break the live URL).
+  - hashlib.sha256(payload).hexdigest() returns lowercase by default --
+    matches the coreutils convention. _parse_sidecar lowercases the input
+    digest so an uppercase sidecar still verifies (defensive against
+    Windows tooling that emits uppercase by default).
+---
+
+## 2026-05-19 - US-012
+- bin/promptpal NEW: bash launcher, executable. Two responsibilities:
+  (1) duplicate the WSL HOME guard from core/platform.py before Python
+  starts, (2) `exec python3 -m core.main "$@"` so Python becomes the
+  process and inherits signals cleanly. set -euo pipefail, prefix-only
+  case match on $HOME against /mnt/c/* and /c/*, dev-checkout
+  PYTHONPATH prepend gated on `core/` being adjacent.
+- core/main.py NEW: 5-statement module that re-exports `main()` from
+  core.cli and runs it under `if __name__ == "__main__"`. Exists so
+  `python3 -m core.main` is the stable launcher contract; the actual
+  CLI implementation stays in core/cli.py untouched.
+- core/cli.py: stale "until US-012 lands" comment refreshed.
+- tests/unit/test_bin_promptpal.py NEW: 19 tests covering AC #1
+  (delegation + argv-verbatim forwarding + exit-code propagation via
+  exec, both verified with a tmp_path python3 shim), AC #1b
+  (core.main.main delegates to core.cli.main via monkeypatch on the
+  `_cli_main` binding), AC #2 (WSL guard parametrised for /mnt/c/* and
+  /c/*, prefix-only matching with negative substring case, message
+  text pinned line-by-line against WSL_LAUNCH_FIX_MESSAGE, ordering
+  pinned by sending an unknown flag and asserting argparse's
+  "unrecognized" doesn't appear), AC #3 (shellcheck clean test,
+  pytest.skip if not installed), AC #4 (strict bash mode + LF line
+  endings).
+- shellcheck bootstrap: `pipx install shellcheck-py` lays down
+  `~/.local/bin/shellcheck` (v0.11.0). pipx is preinstalled; pip is
+  not. apt-sudo isn't available. Document for next iteration that
+  uses shellcheck.
+- pytest 516 passed (was 497 before US-012). pyright clean. ruff clean
+  on new files. coverage: core/main.py 100%, project 96%.
+- **Learnings for future iterations:**
+  - The launcher pattern is: bash wrapper does platform guards that
+    must beat Python's import phase, then `exec python3 -m <module>`.
+    Use `case "${HOME:-}" in /prefix/*|/other/*) ... ;; esac` for
+    prefix matching — shellcheck-clean, posix-portable, and bash's
+    glob-only semantics give you the "prefix-not-substring" behaviour
+    for free (a HOME like /tmp/foo/mnt/c won't match because there's
+    no leading prefix). Pin this with a negative test or the next
+    edit might "fix" the guard to use `[[ "$HOME" == */mnt/c/* ]]`
+    and silently break.
+  - `python3 -m core.main` requires a `core/main.py` (or
+    `core/__main__.py`) — we picked main.py so the import target
+    surfaces in tracebacks as `core.main` rather than `core.__main__`,
+    matches the launcher's command line. core/main.py imports
+    `main as _cli_main from core.cli` and re-exports; tests patch
+    `core.main._cli_main` (NOT `core.cli.main`) when verifying
+    delegation, because the re-export rebinds at import time.
+  - bash subprocess tests for argv forwarding: write a `python3`
+    shim into tmp_path/bin that does `printf "%s\n" "$@" > argsfile`,
+    point PATH at it, and read argsfile. Reliable, no eval needed,
+    catches any wrapper-side argv munging immediately.
+  - shellcheck-py is the cleanest no-sudo install path. The `pipx`
+    wrapping makes `~/.local/bin/shellcheck` an isolated venv,
+    auto-shimmed. Took one iteration to find; document so future
+    bash-script stories don't waste a cycle on it.
+  - When the harness places a parallel `tests/integration/test_*.py`
+    file that overlaps a new unit test, prefer keeping the unit-test
+    location (matches the rest of the suite) and lift in the missing
+    high-value assertions (argv shim, exit-code propagation,
+    prefix-not-substring) rather than duplicating. The Ralph harness
+    sometimes regenerates exploratory files between iterations.
 ---

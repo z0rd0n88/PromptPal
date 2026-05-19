@@ -46,12 +46,12 @@ it to be read only from the ``ANTHROPIC_API_KEY`` env var, never from
 from __future__ import annotations
 
 import json
-import os
 import sys
-import tempfile
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Any, Literal
+
+from core._io import atomic_write_bytes
 
 
 PreferredBackend = Literal["auto", "claude-cli", "api-key"]
@@ -229,28 +229,14 @@ def load_config(path: str | Path) -> Config:
 def save_config(cfg: Config, path: str | Path) -> None:
     """Atomically write ``cfg`` to ``path`` (UTF-8, LF, trailing newline).
 
-    Uses ``tempfile.mkstemp`` + ``os.replace`` per US-002 AC #6. The
-    tempfile is created in the same directory as ``path`` so the replace
-    is on the same filesystem (atomic on POSIX, best-effort on Windows).
+    Delegates to :func:`core._io.atomic_write_bytes` per US-002 AC #6.
+    The payload is serialized to JSON with ``indent=2`` and a trailing
+    newline so the file is human-readable and matches the convention
+    used by ``defaults/config.json``.
     """
     path_obj = Path(path)
-    path_obj.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=".config-", suffix=".json", dir=str(path_obj.parent)
-    )
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-            payload: dict[str, Any] = {
-                name: getattr(cfg, name) for name in Config.field_names()
-            }
-            json.dump(payload, f, indent=2)
-            f.write("\n")
-        os.replace(tmp_path, path_obj)
-    except Exception:
-        if tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
-        raise
+    payload: dict[str, Any] = {
+        name: getattr(cfg, name) for name in Config.field_names()
+    }
+    body = (json.dumps(payload, indent=2) + "\n").encode("utf-8")
+    atomic_write_bytes(path_obj, body, prefix=".config-", suffix=".json")

@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# PromptPal launcher (US-012).
+#
+# Responsibilities:
+#   1. Duplicate the WSL HOME guard from core/platform.py
+#      (P1-PLAT-03 / P1-ERR-12) so the fix message reaches the user
+#      BEFORE Python imports anything that might choke on an NTFS HOME.
+#   2. Exec ``python3 -m core.main`` so Python becomes the process
+#      and inherits signals cleanly (no orphaned wrapper).
+#
+# Keep the WSL message text in sync with WSL_LAUNCH_FIX_MESSAGE in
+# core/platform.py. Tests pin the bash output against that constant so
+# the two cannot drift silently.
+
+set -euo pipefail
+
+case "${HOME:-}" in
+    /mnt/c/*|/c/*)
+        printf '%s\n' \
+            'Warning: HOME appears to be a Windows path.' \
+            'For best results, launch from WSL:' \
+            '  wsl -d Ubuntu -- promptpal' >&2
+        exit 1
+        ;;
+esac
+
+# Resolve the repo root relative to this script so ``import core`` works
+# from any cwd in a dev checkout. For installed copies (US-013), the
+# ``core`` package will be on PYTHONPATH or site-packages already; in
+# that case this prepend is harmless because the resolved repo_root
+# won't contain a ``core/`` directory.
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "${script_dir}/.." && pwd)"
+if [ -d "${repo_root}/core" ]; then
+    export PYTHONPATH="${repo_root}${PYTHONPATH:+:${PYTHONPATH}}"
+fi
+
+exec python3 -m core.main "$@"

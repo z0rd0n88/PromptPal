@@ -23,3 +23,6 @@ Thumbs.db
 
 # Per-developer Claude Code state (permissions, local overrides)
 .claude/settings.local.json
+
+# Ralph iteration helper (per-iteration test/typecheck launcher)
+.ralph-runner.sh
