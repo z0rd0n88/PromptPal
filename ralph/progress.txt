@@ -180,6 +180,20 @@ Started: 2026-05-18
   REPLAY_EMPTY_TEMPLATE (no assistant turn = no initial_improved
   for the loop to display), and 'Error: could not read session...'
   for JSON/IO errors.
+- Per-flag CLI testing is layered: tests/unit/test_cli.py:TestParseArgs
+  covers argparse-binding correctness ("--model X yields opts.model=='X'"),
+  tests/integration/test_flags.py covers pipeline-correctness ("--model X
+  reaches the backend factory's Config.default_model"). Both layers are
+  needed — a refactor that leaves argparse intact but silently drops a
+  flag from main()'s routing would fail integration but not unit. When
+  adding a NEW flag in some future US, mirror the pair: one parse_args
+  test pinning the field binding + one main() integration test pinning
+  the runtime effect.
+- cmd_search renders session_id TRUNCATED to first 8 chars in its line
+  output ("match-se" not "match-sess"). Tests pinning search results
+  should assert against original_prompt_preview / label (the actual
+  semantic contract of "this entry matched") rather than the rendered
+  session_id substring. Same applies to cmd_show_history's row format.
 
 ---
 
@@ -1109,5 +1123,55 @@ Started: 2026-05-18
     changes from 'not implemented' to a redirect. Tests pin the
     new text. Same shape will apply if a future story moves
     --status or --update-system-prompt to a sub-binary.
+
+---
+
+## 2026-05-19 - US-016
+- tests/integration/test_flags.py NEW: 17 integration tests, one per
+  PRD §5.4 flag (plus the positional `prompt` arg). Drives every flag
+  end-to-end through core/cli.main() with the full seam set (config_path,
+  history_dir, usage_log_path, stdin/stdout/stderr, detect_platform_fn,
+  backend_factory, copy_fn, fetcher, clock, id_factory, skip_wsl_guard)
+  and pins ONE runtime effect per flag rather than just the parsed
+  CLIOptions field. Pure-functional fakes (FakeBackend, _fake_platform,
+  _frozen_clock); zero monkeypatching of sys globals.
+- All AC #1-#11 mandated test files (test_backend.py,
+  test_cli_backend_streamjson.py, test_backend_persistence.py,
+  test_system_prompt.py, test_platform.py, test_history.py,
+  test_config.py, test_diff.py, test_stdin.py, test_pipeline.py,
+  test_flags.py) confirmed on disk; this story closed the
+  test_flags.py gap.
+- AC #12 satisfied: pytest --cov=core reports 95% (well above the 80%
+  threshold). Per-module breakdown unchanged from US-015 except core/cli.py
+  rose from 85% → 86% via the new flag-pipeline paths exercising
+  --show-history, --search, --export, --replay, --update-system-prompt,
+  --uninstall, --backend, and --status through main(). Misses are still
+  the defensive error-handling branches mirroring uncovered paths in
+  _run_pipeline (same shape US-011/US-015 left them).
+- Full project: 625 passed, 2 skipped (was 608+2 before US-016); pyright
+  clean (0 errors, 0 warnings).
+- **Learnings for future iterations:**
+  - cmd_search renders session_id TRUNCATED to first 8 chars in its
+    output line ("match-se" not "match-sess"); when pinning search
+    results in tests, assert against original_prompt_preview (the
+    actual semantic contract of "this entry matched the keyword")
+    rather than the rendered session_id substring.
+  - The pattern of "one assert per flag through main()" cleanly
+    separates the parser-correctness contract (tests/unit/test_cli.py
+    :TestParseArgs — argparse field bindings) from the
+    pipeline-correctness contract (this file — main() honors the
+    flag). A future refactor that leaves the parser intact but
+    silently drops a flag from main() fails this layer, not the
+    parser-only layer.
+  - --update-system-prompt expects fetcher to answer the SHA256 sidecar
+    URL (suffix '.sha256') with bare-hex + newline OR the sha256sum
+    coreutils format ('<hex>  <filename>\n'); the test computes
+    hashlib.sha256(payload).hexdigest() and serves it from a single
+    fetcher closure that branches on url.endswith('.sha256').
+  - The integration test for --replay needs a source session with at
+    least one assistant turn so the loop can display initial_improved;
+    otherwise cmd_replay short-circuits with REPLAY_EMPTY_TEMPLATE.
+    Pin both branches in separate tests if a future story expands
+    --replay's semantics.
 
 ---
