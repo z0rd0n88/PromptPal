@@ -6,8 +6,13 @@ Started: 2026-05-18
 - Tests live in tests/unit/ and tests/integration/; root conftest.py puts the
   repo root on sys.path so `from core.x import y` works from any cwd.
 - Config writes use the tempfile.mkstemp -> os.rename atomic pattern with a
-  '.config-' prefix; the same pattern will be reused for history/session writes
-  (US-008) — extract to a helper if a third call site appears.
+  '.config-' prefix; the same pattern is repeated in core/system_prompt._atomic_
+  write_bytes (prefix '.system-prompt-') and will recur in history/session
+  writes (US-008). When US-008 lands the third tracked variant, extract a
+  shared `atomic_write_bytes(path, payload, *, prefix, suffix)` helper into
+  core/_io.py and have config.save_config + system_prompt._atomic_write_bytes
+  call into it. Until then, the duplication is intentional — each call site
+  has slightly different content shape (text vs bytes) and prefix.
 - All on-disk text is UTF-8 with LF endings (`newline="\n"` on text writes).
 - preferred_backend is normalized through `normalize_preferred_backend()` at
   every entry point so a stale/corrupt value can never crash startup.
@@ -184,4 +189,107 @@ Started: 2026-05-18
     be rejected for `auto_copy`. Adjust if PRD ever requires that coercion.
   - Default field values that depend on $HOME use `field(default_factory=...)`
     so tests can swap HOME safely.
+---
+
+## 2026-05-19 - US-007
+- core/system_prompt.txt (NEW): UTF-8/LF Prompt Builder-style default with 7
+  numbered principles. Non-empty, no CRLF, ships with the repo. (P1-SP-01)
+- core/system_prompt.py (NEW): public surface seed_system_prompt /
+  resolve_system_prompt_path / read_system_prompt / update_system_prompt;
+  exception hierarchy SystemPromptError + SystemPromptMissingError /
+  SystemPromptChecksumError / SystemPromptDownloadError; canonical-message
+  constants MISSING_MESSAGE_TEMPLATE, CHECKSUM_MISMATCH_MESSAGE (P1-ERR-14),
+  DOWNLOAD_FAILED_MESSAGE_TEMPLATE (P1-ERR-15), BUNDLED_SYSTEM_PROMPT_PATH,
+  BACKUP_SUFFIX ('.bak'), SHA256_SIDECAR_SUFFIX ('.sha256'). Tests pin every
+  canonical string verbatim.
+- AC #2 (seed-on-first-run): seed_system_prompt streams via shutil.copyfile so
+  the bundled bytes round-trip exactly (no encoding re-normalization), creates
+  the parent directory on demand, returns True/False so the installer can log
+  whether a seed actually happened.
+- AC #3 (no overwrite without --update-system-prompt): seed_system_prompt is a
+  no-op when target exists -- even an empty file blocks a re-seed. P1-SP-02
+  guarantee enforced by the very first stat call.
+- AC #4 (sha256 verification): update_system_prompt fetches both url and
+  url + '.sha256'; computes hashlib.sha256(payload).hexdigest(); on mismatch
+  raises SystemPromptChecksumError with the canonical P1-ERR-14 message and
+  leaves the target untouched. _parse_sidecar accepts BOTH bare-hex
+  ('<hex>\n') and sha256sum coreutils format ('<hex>  <filename>\n'),
+  lowercases, validates 64 hex chars; malformed sidecars collapse to the same
+  checksum-mismatch error path (a garbled sidecar cannot authorize an
+  overwrite).
+- AC #5 (backup before replace): when target exists, the current bytes are
+  copied to <target>.bak BEFORE the atomic replace. backup_path is RETURNED
+  from update_system_prompt so the CLI surface owns the print-decision
+  (cleaner than coupling this module to stderr). A second update overwrites
+  the prior .bak -- single rolling backup, not a versioned chain.
+- AC #6 (--system-prompt FILE override): resolve_system_prompt_path returns
+  Path(cli_override).expanduser() when given, else
+  config.resolved_system_prompt_path(). cli_override is NEVER written back to
+  Config -- verified by test_resolve_does_not_persist_override, which asserts
+  cfg.system_prompt_path is unchanged after resolution.
+- AC #7 (missing/unreadable -> actionable message): read_system_prompt
+  translates FileNotFoundError / IsADirectoryError / PermissionError /
+  OSError -> SystemPromptMissingError with
+  MISSING_MESSAGE_TEMPLATE.format(path=...). The CLI layer (US-011) will
+  catch and exit 1 with the canonical text.
+- Atomic write contract: _atomic_write_bytes uses
+  tempfile.mkstemp(prefix='.system-prompt-', dir=target.parent) + os.replace
+  for same-FS atomic rename; tempfile unlinked in except on os.replace
+  failure. target.parent.mkdir(parents=True, exist_ok=True) so a first-run
+  --update-system-prompt invocation can run directly into a missing
+  ~/.promptpal/ directory. Verified via tracking-replace test (replace called
+  exactly once, tempfile lives in same dir, no leftover) and disk-full test
+  (os.replace raises -> tempfile unlinked -> target unchanged).
+- Default fetcher (_default_fetcher) is urllib-backed and translates
+  HTTPError/URLError/OSError -> SystemPromptDownloadError with the canonical
+  template; tests inject a programmable fake fetcher (dict[url, bytes]) so
+  the network is never touched. Same injection pattern as ApiBackend.transport
+  and CliBackend.runner -- module-level default + kwarg seam.
+- 51 new tests in tests/unit/test_system_prompt.py covering all 7 ACs +
+  atomic-write semantics + sidecar format tolerance (bare hex, coreutils,
+  uppercase, garbage) + _default_fetcher error translation + happy path via
+  mocked urlopen. Full project 268 tests pass; pyright clean; coverage 98%
+  on core/system_prompt.py (98% across core/). The 2 uncovered lines are
+  the nested OSError catch inside the tempfile-cleanup branch of
+  _atomic_write_bytes -- defensive code that fires only when both os.replace
+  and tmp_path.unlink raise OSError.
+- Files changed: core/system_prompt.txt (NEW), core/system_prompt.py (NEW),
+  tests/unit/test_system_prompt.py (NEW), ralph/prd.json (US-007 ->
+  passes: true), ralph/progress.txt.
+- **Learnings for future iterations:**
+  - "Return path, let caller print" is the right shape for messages that
+    happen inside a library function (the backup-path print here). It
+    keeps the module decoupled from stderr/stdout policy AND lets the CLI
+    layer (US-011) bundle the print with the rest of its output-style
+    handling (--quiet, --output json, etc.).
+  - When you need to support multiple sidecar formats (bare-hex vs
+    sha256sum coreutils), normalize to the first whitespace-separated
+    token and lowercase. Don't try to parse the filename -- it would
+    couple the verifier to the URL/filename mapping unnecessarily.
+  - Test seam pattern across the codebase is now stable: every module
+    that touches the network or filesystem boundary takes an injectable
+    callable (transport, runner, fetcher, sleeper). Production caller
+    passes nothing; tests pass a fake. Match this for US-008 history
+    (e.g. inject a clock for created_at timestamps).
+  - Atomic write helper is now duplicated across config.save_config and
+    system_prompt._atomic_write_bytes. When US-008 (history) lands the
+    third call site, extract to core/_io.py:atomic_write_bytes(path,
+    payload, *, prefix, suffix) and have the existing call sites delegate
+    to it. Until then, the duplication is justified -- each call site has
+    a slightly different prefix/suffix/encoding shape.
+  - The "no overwrite without --update-system-prompt" rule lives in TWO
+    places: seed_system_prompt's exists() short-circuit (P1-SP-02), AND
+    the absence of any code path other than update_system_prompt that
+    writes to system_prompt_path. Don't add a "write_system_prompt" helper
+    in US-008 or US-011 -- the CLI must call update_system_prompt
+    specifically to mutate the file, otherwise the user-data contract is
+    silently broken.
+  - URL + '.sha256' suffix is a convention, not an arg --
+    SHA256_SIDECAR_SUFFIX is a public constant so tests pin the URL shape
+    too (catches accidental changes to '.sha256sum' or '.checksum' that
+    would break the live URL).
+  - hashlib.sha256(payload).hexdigest() returns lowercase by default --
+    matches the coreutils convention. _parse_sidecar lowercases the input
+    digest so an uppercase sidecar still verifies (defensive against
+    Windows tooling that emits uppercase by default).
 ---
