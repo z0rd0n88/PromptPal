@@ -19,6 +19,7 @@ Thumbs.db
 
 # Build artifacts
 .memsearch/
+.worktrees/
 
 # Per-developer Claude Code state (permissions, local overrides)
 .claude/settings.local.json
