@@ -71,6 +71,135 @@ Started: 2026-05-18
   helper module. read_prompt's interactive banner goes to stderr;
   format_diff returns a string. Keep this discipline in US-010
   (refinement loop) — choice line, spinner, raw print all go to stderr.
+- The refinement loop lives in `core/loop.py:run_refinement_loop` and
+  is pure-functional with full IO-seam injection (stdin / stderr /
+  display / choice_reader / feedback_reader / copy_fn). It does NOT
+  call sys.exit, does NOT write session JSON, does NOT call
+  platform.copy_to_clipboard directly — persistence and exit codes are
+  the CLI layer's responsibility (US-011); the clipboard goes through
+  an injected `copy_fn` so tests don't need a real provider. Returns a
+  LoopOutcome(status, final_prompt, messages, new_turns); the caller
+  folds new_turns into the in-flight Session and writes it via
+  history.write_session + finalize_session.
+- The loop's `messages` is a list[dict[str, str]] projection of the
+  conversation — caller seeds initial_messages with the original user
+  turn + first assistant response; each [i]terate appends a user turn
+  + assistant turn. Backend.complete is invoked with a DEFENSIVE COPY
+  of messages so a misbehaving backend that mutates its argument
+  cannot corrupt the loop's state (test pins this).
+- Choice normalization is case-insensitive and FIRST-CHARACTER-ONLY:
+  'accept yes' / 'A' / 'a' all map to ACTION_ACCEPT. EOF on stdin
+  (readline → '') bails as STATUS_DISCARDED so a closed input stream
+  cannot infinite-loop the test suite.
+
+---
+
+## 2026-05-19 - US-010
+- core/loop.py NEW: run_refinement_loop(*, backend, system,
+  initial_messages, initial_improved, original_prompt,
+  auto_iterations=0, copy_on_accept=False, stdin=None, stderr=None,
+  display=None, choice_reader=None, feedback_reader=None,
+  copy_fn=None) -> LoopOutcome. Public surface also exports
+  LoopOutcome / LoopTurn (frozen dataclasses), canonical-message
+  constants CHOICE_PROMPT, ITERATE_FEEDBACK_PROMPT,
+  SYNTHESIZED_FEEDBACK ('Improve this further.'), RAW_HEADER,
+  COPY_SUCCESS_MESSAGE, action constants ACTION_ACCEPT/ITERATE/
+  DISCARD/RAW/COPY, status constants STATUS_ACCEPTED/STATUS_DISCARDED
+  matching history's, and VALID_ACTIONS.
+- AC #1 / P1-LOOP-01: CHOICE_PROMPT '[a]ccept [i]terate [d]iscard
+  [r]aw [c]opy: ' is the source of truth for the menu; default
+  choice_reader writes it to STDERR before stdin.readline().
+- AC #2 / P1-LOOP-02: [i]terate appends a user turn with the
+  feedback, calls backend.complete(system, [defensive copy of
+  messages]), appends assistant response — full conversation sent
+  every call, no truncation. Tests assert the 3rd iterate's payload
+  is 7 messages (initial 2 + 2 prior u/a pairs + new user feedback).
+- AC #3 / P1-LOOP-03: test_three_iterations_in_one_session exercises
+  ['i','i','i','a'] with backend queue depth 3; all 3 calls land.
+- AC #4 / P1-LOOP-04: [a]ccept returns LoopOutcome(status=
+  STATUS_ACCEPTED, final_prompt, messages, new_turns). When
+  copy_on_accept=True AND copy_fn is wired, calls copy_fn(improved)
+  and prints COPY_SUCCESS_MESSAGE on True; on False the wrapped
+  copy_fn is responsible for its own warning (platform.copy_to_
+  clipboard prints NO_CLIPBOARD_WARNING) so we don't double-print.
+- AC #5 / P1-LOOP-05: [d]iscard returns LoopOutcome(status=
+  STATUS_DISCARDED, final_prompt=latest improved) — the historical
+  record reflects what the user saw, even after an iterate.
+- AC #6 / P1-LOOP-06: [r]aw prints RAW_HEADER + improved to STDERR
+  (P1-PIPE-09 upheld — never stdout) and re-presents the choice
+  line. Repeated [r]aw is allowed; capsys.readouterr().out is empty.
+- AC #7 / P1-LOOP-07: [c]opy calls copy_fn; when copy_fn=None prints
+  'Warning: no clipboard provider available.' to stderr and re-
+  presents the choice line (P1-PLAT-07 non-fatal contract).
+- AC #8 / P1-LOOP-08: auto_iterations=N runs N synthesized 'Improve
+  this further.' rounds BEFORE the first choice line. Exactly one
+  display() call fires after the final auto-iteration (not one per
+  round) — minimizes screen churn while still showing the user the
+  result they're being asked to accept. auto_iterations<0 treated as
+  0 (defensive default — never crash on a caller typo).
+- Pipe-safety: zero stdout writes anywhere in the module (pinned by
+  test_loop_writes_nothing_to_stdout using capsys).
+- Defensive backend handling: _iterate passes a list[dict] copy to
+  backend.complete so a backend that mutates its messages argument
+  (e.g. clears it and injects new ones) cannot poison the loop's
+  internal log. Test_backend_mutation_of_messages_does_not_corrupt_
+  state pins this.
+- Choice normalization: case-insensitive, first-char-only. 'accept
+  yes' → ACTION_ACCEPT, 'iterate now' → ACTION_ITERATE. EOF on stdin
+  (readline returns '') bails as STATUS_DISCARDED.
+- AC-MT-01 regression bait: a 'Human:' literal in the user prompt
+  survives the loop's messages projection byte-identical (no role-
+  prefix flattening). Test_human_colon_in_user_prompt_survives_
+  round_trip pins this.
+- 41 new tests in tests/integration/test_pipeline.py covering all 8
+  ACs plus defensive paths (typo'd choice, EOF, case insensitivity,
+  mutating backend, alias safety, AC-MT-01). Full project 420 tests
+  pass (was 379 before US-010); pyright clean; coverage 100% on
+  core/loop.py, 99% across core/.
+- Files changed: core/loop.py (NEW), tests/integration/test_
+  pipeline.py (NEW), ralph/prd.json (US-010 → passes: true),
+  ralph/progress.txt.
+- **Learnings for future iterations:**
+  - The "loop returns a value, caller persists" split keeps the
+    refinement loop testable without a real history dir, and lets
+    the CLI layer (US-011) decide things like '--no-history skips
+    write_session entirely'. Don't fold session writes into the loop
+    even though the AC text reads 'writes session JSON' — the
+    structural contract is 'caller writes session based on outcome
+    status', and the integration tests will pin that the CLI
+    coordinates it correctly.
+  - copy_fn=None means 'no clipboard wired'. The CLI layer (US-011)
+    will set copy_fn = functools.partial(copy_to_clipboard,
+    platform=platform); platform.copy_to_clipboard prints its own
+    NO_CLIPBOARD_WARNING on no-provider and returns False — DO NOT
+    double-print the warning here. On the [c]opy menu action with
+    copy_fn=None (clipboard hasn't been wired at all), the loop
+    prints its own warning so the user knows the action was a no-op.
+  - The choice line is the loop's structural contract — keep it in
+    one place (CHOICE_PROMPT constant) and assert all 5 actions
+    appear in it. If a future iteration adds [s]ave or [n]ame, the
+    test that pins '[a]ccept [i]terate [d]iscard [r]aw [c]opy in
+    CHOICE_PROMPT' will guide where the new action lands relative
+    to the existing menu.
+  - The auto-iteration display contract is 'show the user what
+    they're being asked to accept' — one display call after the
+    final auto-iteration, not one per round. This matches what a
+    CLI user actually wants: they typed `--iterations 3` to skip
+    the intermediate steps, so don't surface them.
+  - Backend mutation defense (the defensive-copy in _iterate) is
+    cheap and prevents an entire class of action-at-a-distance
+    bugs. Adopt the same pattern in US-011 (CLI) when threading
+    messages between layers — a list copy is O(n) of pointers,
+    not contents, and the loop's messages list grows at most 2N+2
+    deep for N iterations. The cost is invisible at any
+    reasonable N.
+  - Tests that use a queue-based choice_reader / feedback_reader
+    self-terminate naturally: the queue empties → eof_reader
+    returns '' → loop bails as discard. This is safer than test
+    timeouts and means a misconfigured test (wrong number of
+    inputs queued) fails loudly with a specific status assertion.
+    Replicate this pattern when wiring tests for US-011's argparse
+    layer.
 
 ---
 
