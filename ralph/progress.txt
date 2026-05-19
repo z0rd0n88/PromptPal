@@ -20,7 +20,87 @@ Started: 2026-05-18
   verbatim. Tests pin the message string so accidental drift breaks the suite.
 - The Windows MSIX-launched session writes to WSL via UNC paths; pytest/pyright
   must run under WSL via uv. `.ralph-runner.sh` (gitignored) wraps the uv calls
-  for each iteration: `bash .ralph-runner.sh test|typecheck|cov`.
+  for each iteration: `bash .ralph-runner.sh test|typecheck|cov`. The
+  typecheck command MUST include `--with pytest` so test files don't report
+  spurious "Import pytest could not be resolved" errors.
+- Backend resolution + persistence live in core/resolve.py. The CLI layer
+  drives the persistence policy from outside resolve_backend: clear_backend_
+  preference BEFORE resolution (when --backend auto), persist_backend_
+  preference AFTER first successful turn (when --backend claude-cli|api-key).
+  Failed turns must not call persist_* — the contract is structural, enforced
+  by the caller's try/except, not by a guard inside the persist helper.
+
+---
+
+## 2026-05-19 - US-006
+- core/resolve.py: resolve_backend(preferred, model, *, config, env=None,
+  which=None, api_factory=None, cli_factory=None) implementing the
+  P1-BKND-04..07 ladder — explicit flag → Config.preferred_backend →
+  auto-detect. clear_backend_preference(config_path) writes 'auto' to disk
+  immediately (AC #6). persist_backend_preference(config_path, value) writes
+  'claude-cli'/'api-key' to disk after the first successful turn (AC #5).
+  Both helpers go through load_config + dataclasses.replace + save_config so
+  the atomic-write contract (P1-CFG-05) and the "preserve other Config
+  fields" invariant come for free.
+- AC #2 / P1-BKND-05: --backend claude-cli + missing claude → CliNotFoundError
+  even when ANTHROPIC_API_KEY is set. No silent fallback to API.
+- AC #3 / P1-BKND-06: --backend api-key + unset ANTHROPIC_API_KEY (or empty
+  string) → ApiKeyMissingError even when claude is on PATH. No silent
+  fallback to CLI.
+- AC #4 / P1-BKND-07: both unavailable → NoBackendError with the
+  'Option 1 (Claude CLI):' / 'Option 2 (API key):' two-option block (the
+  message already lived on NoBackendError.MESSAGE from US-001).
+- AC #7: failed call does not persist — the contract is structural (caller's
+  try/except skips the persist call), so resolve.py's persist helper has no
+  internal "did the call succeed" gate.
+- env injected via Mapping[str, str] (defaults to os.environ); which
+  injected via Callable[[str], str|None] (defaults to shutil.which); both
+  backend factories injected (defaults to the real ApiBackend/CliBackend).
+  Tests substitute stub subclasses of Backend so ApiBackend's
+  ANTHROPIC_API_KEY-required constructor doesn't trip the test path.
+- 33 new tests: 14 in tests/unit/test_backend.py (resolve_backend selection
+  + error paths) + 19 in tests/unit/test_backend_persistence.py NEW
+  (persist/clear semantics, atomic-write inheritance, AC-BKND-04 end-to-end).
+  Full project 217 tests pass; pyright clean (after wiring `--with pytest`
+  into .ralph-runner.sh's typecheck command); coverage 100% on
+  core/resolve.py, 98% across core/.
+- Files changed: core/resolve.py (NEW), tests/unit/test_backend.py (extend
+  with resolve_backend section + helpers + fakes), tests/unit/
+  test_backend_persistence.py (NEW), .ralph-runner.sh (add --with pytest to
+  typecheck), ralph/prd.json (US-006 → passes: true), ralph/progress.txt.
+- **Learnings for future iterations:**
+  - The persistence policy (clear-on-auto immediately, persist-after-success)
+    cannot be enforced from inside resolve_backend because the caller has to
+    sequence the turn between them. Future US-010 (refinement loop) and
+    US-011 (CLI argparse) MUST call clear_backend_preference BEFORE
+    resolve_backend when args.backend == 'auto', and call
+    persist_backend_preference AFTER the first successful complete() when
+    args.backend in ('claude-cli','api-key'). Subsequent turns in the same
+    session should not re-persist (the field is already set).
+  - PRD AC #2 says "fail immediately with FileNotFoundError" but the
+    existing CliNotFoundError(CliError) hierarchy from US-005 already
+    carries the canonical message. I chose to raise CliNotFoundError, NOT
+    actual FileNotFoundError — making CliNotFoundError multiply inherit
+    from FileNotFoundError was rejected as needless complexity given that
+    the canonical message and the CLI surfacing pattern are what matter
+    (tests pin the message text, not the class hierarchy). If a future
+    spec amendment really requires `except FileNotFoundError` to catch it,
+    add `FileNotFoundError` as a second base on CliNotFoundError and the
+    existing tests still pass.
+  - resolve_backend takes a `config` kwarg (not a path) so the CLI can
+    pass the *already-mutated* in-memory Config to it after
+    clear_backend_preference has run. Loading from disk inside
+    resolve_backend would race with the immediate-clear write.
+  - _effective_preference compresses (CLI flag, Config) into a single
+    'effective' value (one of "auto"/"claude-cli"/"api-key") BEFORE the
+    PATH/env gates run. This keeps the ladder readable and lets the
+    "explicit auto bypasses Config" rule live in one place. Unknown
+    preferred values collapse to "auto" defensively — never crash on a
+    caller typo.
+  - Coverage gaps are easy to introduce with optional-arg defaulting
+    (`env or os.environ`) — use `env if env is not None else os.environ`
+    so a caller passing `env={}` (empty mapping) doesn't silently fall
+    through to the real environment. Same pattern for `which`.
 
 ---
 
