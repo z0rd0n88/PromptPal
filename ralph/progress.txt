@@ -55,6 +55,101 @@ Started: 2026-05-18
   accepts an injectable `clock` / `id_factory` so tests can pin
   timestamps and session ids without monkeypatching. Same shape as
   transport/runner/fetcher in earlier modules.
+- Prompt input resolution lives in `core/input.py:read_prompt` and is
+  pure-functional (returns a string, never sys.exit()s). Selection
+  order: positional arg → stdin pipe (non-TTY) → interactive (TTY).
+  Whitespace-only/empty input at any stage raises
+  `EmptyPromptError(EMPTY_PROMPT_MESSAGE)` so callers can map a single
+  failure mode to a single canonical stderr line + exit 1.
+- Diff rendering lives in `core/diff.py` and is also pure: returns the
+  diff string; the CLI layer prints it to stderr (P1-PIPE-09). The
+  ">3 lines" threshold uses `len(improved.splitlines())` so a
+  trailing-newline doesn't shift the count — `'a\\nb\\nc'` and
+  `'a\\nb\\nc\\n'` are both 3 lines.
+- Pipe-safety contract (P1-PIPE-09 — improved prompt to stdout, all
+  else to stderr) is enforced by NOT writing to stdout from any
+  helper module. read_prompt's interactive banner goes to stderr;
+  format_diff returns a string. Keep this discipline in US-010
+  (refinement loop) — choice line, spinner, raw print all go to stderr.
+
+---
+
+## 2026-05-19 - US-009
+- core/input.py NEW: read_prompt(positional_arg, *, stdin=None,
+  stderr=None, isatty=None) -> str; EmptyPromptError(ValueError) with
+  MESSAGE class constant; constants EMPTY_PROMPT_MESSAGE and
+  INTERACTIVE_PROMPT_BANNER pinned verbatim by tests. Three input modes
+  (P1-PIPE-01..03): positional arg → stdin pipe (non-TTY) → interactive
+  (TTY). Whitespace-only / empty input at any stage raises
+  EmptyPromptError; the CLI layer (US-011) will map that to exit 1 +
+  EMPTY_PROMPT_MESSAGE on stderr.
+- core/diff.py NEW: line_count(text), should_show_diff(improved),
+  format_diff(original, improved, *, fromfile, tofile); constants
+  DIFF_LINE_THRESHOLD=3, DEFAULT_FROMFILE='original',
+  DEFAULT_TOFILE='improved'. should_show_diff uses
+  len(improved.splitlines()) > 3 so trailing-newline doesn't shift the
+  count — 'a\\nb\\nc' and 'a\\nb\\nc\\n' are both 3 lines and BOTH fall
+  under the threshold. format_diff uses difflib.unified_diff with
+  lineterm='' so the joined output has no double-newline gaps;
+  identical inputs return ''.
+- AC #1 / P1-PIPE-01: positional_arg returned byte-identical when
+  non-empty after strip; AC-MT-01 regression bait ('Human:' in user
+  prompt) survives this layer untouched.
+- AC #2 / P1-PIPE-02: stdin.read() returned verbatim, no trim of the
+  trailing newline so multi-line piped payloads round-trip clean.
+- AC #3 / P1-PIPE-03: INTERACTIVE_PROMPT_BANNER written to STDERR
+  before stdin.read() — never stdout, never sys.stdout (the test
+  uses io.StringIO for stderr and asserts equality with the banner).
+- AC #4 / P1-PIPE-06: should_show_diff boundary pinned by
+  parametrized tests at the exact 3-vs-4 line edge. format_diff
+  output contains the canonical '--- original' / '+++ improved' /
+  '@@' marker triad; identical inputs collapse to ''.
+- AC #5 / P1-PIPE-09: neither module writes to stdout. read_prompt's
+  banner goes to stderr; format_diff returns a string and the CLI
+  layer is responsible for writing it. This module-level discipline
+  is the structural enforcement of the pipe-safety contract.
+- 47 new tests: 28 in tests/unit/test_diff.py (constants + line_count
+  + should_show_diff boundary + format_diff markers / custom
+  filenames / UTF-8 / parametrized 3-vs-4 line edge), 19 in
+  tests/integration/test_stdin.py (positional / stdin-pipe /
+  interactive with explicit io.StringIO seams + default-isatty
+  fallback when isatty kwarg omitted). Full project 379 tests pass
+  (was 332 before US-009); pyright clean; coverage 100% on
+  core/input.py and core/diff.py, 99% across core/.
+- Files changed: core/input.py (NEW), core/diff.py (NEW),
+  tests/unit/test_diff.py (NEW), tests/integration/test_stdin.py
+  (NEW), ralph/prd.json (US-009 → passes: true), ralph/progress.txt.
+- **Learnings for future iterations:**
+  - The "pure-functional + injectable IO seam" shape that worked for
+    backend transport / runner / fetcher works just as well for
+    stdin/stderr/isatty. Tests construct io.StringIO instances
+    locally rather than monkeypatching sys globals — no leakage
+    risk between tests, parallel-safe.
+  - "improved length > 3 lines" reads naturally as a > comparison
+    against splitlines() count. Resist the temptation to count
+    newlines directly: 'a\\nb\\nc' has 2 newlines but 3 lines, and
+    'a\\nb\\nc\\n' has 3 newlines but still 3 lines. splitlines
+    normalizes both shapes to 3.
+  - The empty-prompt failure mode IS a separate error class
+    (EmptyPromptError, not raised on a generic ValueError) so the
+    US-011 CLI layer can catch it specifically and map to the
+    canonical exit-1 + stderr message. Same pattern as
+    SystemPromptMissingError / NoBackendError — each canonical
+    user-visible error is one class with one constant message.
+  - Whitespace-only positional arg raises rather than falling through
+    to stdin. The reasoning: the user explicitly typed
+    `promptpal ""` or `promptpal "   "`, which is almost always a
+    shell-quoting bug; falling through silently would consume stdin
+    they didn't intend to provide. This is the same defensive-default
+    pattern as US-006's preferred_backend collapsing to 'auto' on
+    unknown typo — explicit caller error → explicit explainable
+    failure, never silent recovery into the next mode.
+  - The pipe-safety contract (P1-PIPE-09) is structurally enforced by
+    NOT writing to stdout in any helper module. US-010 (refinement
+    loop) must continue this discipline — the choice line, spinner
+    frames, raw print, and copy confirmations all go to stderr; only
+    the final improved prompt lands on stdout (and only when the
+    pipeline reaches the accept branch).
 
 ---
 
