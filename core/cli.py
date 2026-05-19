@@ -126,11 +126,24 @@ SHOW_HISTORY_PAGE_SIZE: int = 20
 # Canonical messages — pinned verbatim by tests.
 
 UNINSTALL_NOT_IMPLEMENTED: str = (
-    "Error: --uninstall is not implemented in this build. See US-015."
+    "The --uninstall flag is a launcher convenience that delegates to "
+    "uninstall.sh. Run that script directly: bash uninstall.sh [--purge]."
 )
-REPLAY_NOT_IMPLEMENTED: str = (
-    "Error: --replay is not implemented in this build. See US-015."
+"""Surfaced when ``--uninstall`` is passed to the CLI.
+
+The actual removal logic lives in ``uninstall.sh`` (US-015) so the
+Python process doesn't have to delete itself mid-run. The flag stays
+wired so ``--help`` advertises it and the parser doesn't reject it.
+"""
+
+REPLAY_NOT_FOUND_TEMPLATE: str = "Error: session {session_id!r} not found."
+"""Stderr line when ``--replay SESSION_ID`` can't locate the source session."""
+
+REPLAY_EMPTY_TEMPLATE: str = (
+    "Error: session {session_id!r} has no assistant turn to replay from."
 )
+"""Stderr line when ``--replay`` targets a session that never got an assistant reply."""
+
 EXPORT_NOT_FOUND_TEMPLATE: str = "Error: session {session_id!r} not found."
 UPDATE_SUCCESS_TEMPLATE: str = "System prompt updated at {path}."
 UPDATE_BACKUP_TEMPLATE: str = "Previous prompt backed up at {path}."
@@ -531,6 +544,205 @@ def cmd_export(
         file=stdout,
     )
     return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# --replay (P1-LOOP-*, US-015)
+# ---------------------------------------------------------------------------
+
+
+def _seed_messages_from_session(session: Session) -> tuple[list[dict[str, str]], str]:
+    """Replay a saved session's turns into a fresh ``messages`` list.
+
+    Returns ``(messages, last_assistant_text)``. The ``messages`` list
+    is a list-of-dicts projection of the saved ``turns`` in the shape
+    the loop and the backends expect (``{"role": ..., "content": ...}``);
+    the second element is the most recent assistant ``content`` so the
+    caller can pass it to ``run_refinement_loop`` as ``initial_improved``
+    without re-walking the list.
+
+    Turns whose role is anything other than ``"user"`` or ``"assistant"``
+    (defensive — shouldn't appear in real sessions) are dropped silently
+    rather than crashing the replay.
+    """
+    messages: list[dict[str, str]] = []
+    last_assistant: str | None = None
+    for t in session.turns:
+        if t.role not in ("user", "assistant"):
+            continue
+        messages.append({"role": t.role, "content": t.content})
+        if t.role == "assistant":
+            last_assistant = t.content
+    return messages, (last_assistant or "")
+
+
+def cmd_replay(
+    *,
+    session_id: str,
+    options: CLIOptions,
+    config: Config,
+    config_path: Path,
+    history_dir: Path,
+    usage_log_path: Path,
+    system_prompt_path: Path,
+    platform: Platform,
+    backend: Backend,
+    stdin: TextIO,
+    stdout: TextIO,
+    stderr: TextIO,
+    copy_fn: Callable[[str], bool],
+    clock: Callable[[], str] | None,
+    id_factory: Callable[[], str] | None,
+) -> int:
+    """Run ``--replay SESSION_ID``: load the session, enter the refinement loop.
+
+    AC #3 (US-015) — "load specified session, replay messages into a
+    *new* session, enter refinement loop". The source session is read-
+    only; a fresh :class:`Session` is created with a new ``session_id``
+    and the source's turns are folded in. ``--name LABEL`` overrides the
+    label on the new session (the source's label is intentionally not
+    carried forward — a replay represents a new line of refinement).
+
+    Failure modes (printed to stderr, return :data:`EXIT_FAILURE`):
+
+    - Source session not found → :data:`REPLAY_NOT_FOUND_TEMPLATE`
+    - Source session corrupt/unreadable → ``"Error: could not read ..."``
+    - Source session has no assistant turn → :data:`REPLAY_EMPTY_TEMPLATE`
+      (the loop can't enter without an ``initial_improved`` value to
+      display first).
+    """
+    try:
+        source = read_session(session_id, history_dir)
+    except SessionNotFoundError:
+        print(
+            REPLAY_NOT_FOUND_TEMPLATE.format(session_id=session_id),
+            file=stderr,
+        )
+        return EXIT_FAILURE
+    except (OSError, json.JSONDecodeError) as e:
+        print(
+            f"Error: could not read session {session_id!r}: {e}",
+            file=stderr,
+        )
+        return EXIT_FAILURE
+
+    messages, initial_improved = _seed_messages_from_session(source)
+    if not initial_improved:
+        print(
+            REPLAY_EMPTY_TEMPLATE.format(session_id=session_id),
+            file=stderr,
+        )
+        return EXIT_FAILURE
+
+    try:
+        system = read_system_prompt(system_prompt_path)
+    except SystemPromptMissingError as e:
+        print(str(e), file=stderr)
+        return EXIT_FAILURE
+
+    backend_short = _short_backend_name(backend)
+
+    # Build the *new* session that this replay produces. The original
+    # session on disk is left untouched (read-only source-of-truth);
+    # all writes below land at the new session_id.
+    new_sess = new_session(
+        original_prompt=source.original_prompt,
+        model=config.default_model,
+        backend=backend_short,
+        label=options.name,
+        clock=clock,
+        id_factory=id_factory,
+    )
+    # Fold the source's turns into the new session in order so the
+    # written file reflects the full replayed history. Token counts and
+    # per-turn backend names from the source carry through verbatim —
+    # they describe what *originally* produced those turns, not the
+    # replay backend.
+    for t in source.turns:
+        if t.role not in ("user", "assistant"):
+            continue
+        new_sess = append_turn(
+            new_sess,
+            role=t.role,
+            content=t.content,
+            backend=t.backend,
+            input_tokens=t.input_tokens,
+            output_tokens=t.output_tokens,
+            clock=clock,
+        )
+
+    if config.history_enabled and not options.no_history:
+        _try_write_session(new_sess, history_dir, stderr=stderr)
+
+    iterations = options.iterations if options.iterations is not None else 0
+
+    try:
+        outcome = run_refinement_loop(
+            backend=backend,
+            system=system,
+            initial_messages=messages,
+            initial_improved=initial_improved,
+            original_prompt=source.original_prompt,
+            auto_iterations=max(0, iterations),
+            copy_on_accept=(options.copy or config.auto_copy),
+            stdin=stdin,
+            stderr=stderr,
+            copy_fn=copy_fn,
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"Error: {e}", file=stderr)
+        return EXIT_FAILURE
+
+    new_sess = _fold_outcome_into_session(
+        new_sess, outcome=outcome, backend_short=backend_short, clock=clock
+    )
+    final_status = (
+        STATUS_ACCEPTED if outcome.status == STATUS_ACCEPTED else "discarded"
+    )
+    new_sess = finalize_session(
+        new_sess,
+        status=final_status,
+        final_prompt=outcome.final_prompt
+        if outcome.status == STATUS_ACCEPTED
+        else None,
+        clock=clock,
+    )
+
+    if config.history_enabled and not options.no_history:
+        for offset, lt in enumerate(outcome.new_turns, start=1):
+            try:
+                append_usage_entry(
+                    usage_log_path,
+                    session_id=new_sess.session_id,
+                    turn_index=offset,
+                    backend=backend_short,
+                    model=config.default_model,
+                    input_tokens=lt.input_tokens,
+                    output_tokens=lt.output_tokens,
+                    clock=clock,
+                )
+            except OSError:
+                pass
+        _try_write_session(new_sess, history_dir, stderr=stderr)
+        try:
+            enforce_max_entries(history_dir, config.max_history_entries)
+        except OSError:
+            pass
+
+    if outcome.status == STATUS_ACCEPTED:
+        print(
+            format_output(
+                output=options.output,
+                original=source.original_prompt,
+                improved=outcome.final_prompt,
+                turns=len(source.turns) + len(outcome.new_turns),
+                session_id=new_sess.session_id,
+                backend_name=backend_short,
+                model=config.default_model,
+            ),
+            file=stdout,
+        )
+    return EXIT_OK if outcome.status == STATUS_ACCEPTED else EXIT_DISCARDED
 
 
 # ---------------------------------------------------------------------------
@@ -1117,14 +1329,12 @@ def main(
         )
 
     if options.uninstall:
-        # US-015 owns the real implementation; keep the flag wired so
-        # the parser doesn't reject it and ``--help`` still lists it.
+        # The actual removal logic lives in ``uninstall.sh`` (US-015) so
+        # the Python process doesn't have to delete itself mid-run. The
+        # flag stays wired so ``--help`` advertises it and the parser
+        # doesn't reject it; ``UNINSTALL_NOT_IMPLEMENTED`` points the
+        # user at the right script.
         print(UNINSTALL_NOT_IMPLEMENTED, file=stderr_in)
-        return EXIT_FAILURE
-
-    if options.replay is not None:
-        # US-015 owns the real implementation.
-        print(REPLAY_NOT_IMPLEMENTED, file=stderr_in)
         return EXIT_FAILURE
 
     # ----- normal pipeline -----
@@ -1173,6 +1383,25 @@ def main(
         if copy_fn is not None
         else (lambda text: copy_to_clipboard(text, platform))
     )
+
+    if options.replay is not None:
+        return cmd_replay(
+            session_id=options.replay,
+            options=options,
+            config=config,
+            config_path=config_path_p,
+            history_dir=history_dir_p,
+            usage_log_path=usage_log_p,
+            system_prompt_path=system_prompt_path_resolved,
+            platform=platform,
+            backend=backend,
+            stdin=stdin_in,
+            stdout=stdout_in,
+            stderr=stderr_in,
+            copy_fn=copy_fn_resolved,
+            clock=clock,
+            id_factory=id_factory,
+        )
 
     return _run_pipeline(
         options=options,

@@ -38,7 +38,8 @@ from core.cli import (
     OUTPUT_JSON,
     OUTPUT_MARKDOWN,
     OUTPUT_PLAIN,
-    REPLAY_NOT_IMPLEMENTED,
+    REPLAY_EMPTY_TEMPLATE,
+    REPLAY_NOT_FOUND_TEMPLATE,
     UNINSTALL_NOT_IMPLEMENTED,
     UPDATE_SUCCESS_TEMPLATE,
     CLIOptions,
@@ -852,7 +853,8 @@ class TestMainEarlyExits:
         assert rc == EXIT_OK
         assert tmp_promptpal["system_prompt"].read_bytes() == payload
 
-    def test_uninstall_not_implemented(self, tmp_promptpal: dict[str, Path]) -> None:
+    def test_uninstall_points_to_script(self, tmp_promptpal: dict[str, Path]) -> None:
+        """--uninstall surfaces the canonical message pointing at uninstall.sh."""
         stderr = io.StringIO()
         rc = main(
             ["--uninstall"],
@@ -868,23 +870,410 @@ class TestMainEarlyExits:
         )
         assert rc == EXIT_FAILURE
         assert UNINSTALL_NOT_IMPLEMENTED in stderr.getvalue()
+        assert "uninstall.sh" in UNINSTALL_NOT_IMPLEMENTED
 
-    def test_replay_not_implemented(self, tmp_promptpal: dict[str, Path]) -> None:
+
+# ===========================================================================
+# US-015 — --replay flow
+# ===========================================================================
+
+
+def _seed_replay_session(
+    history_dir: Path,
+    *,
+    session_id: str = "replay-source-1",
+    original_prompt: str = "the original prompt",
+    final_text: str = "the prior improved text",
+    label: str | None = None,
+) -> None:
+    """Persist a source session ready for replay.
+
+    Two turns: user → assistant. The assistant text becomes the loop's
+    initial_improved when --replay loads it.
+    """
+    session = Session(
+        session_id=session_id,
+        created_at="2026-05-15T12:00:00Z",
+        updated_at="2026-05-15T12:00:30Z",
+        status="accepted",
+        label=label,
+        original_prompt=original_prompt,
+        model="claude-sonnet-4-6",
+        backend="api-key",
+        turns=(
+            Turn(
+                role="user",
+                content=original_prompt,
+                backend="api-key",
+                input_tokens=None,
+                output_tokens=None,
+                timestamp="2026-05-15T12:00:00Z",
+            ),
+            Turn(
+                role="assistant",
+                content=final_text,
+                backend="api-key",
+                input_tokens=12,
+                output_tokens=34,
+                timestamp="2026-05-15T12:00:30Z",
+            ),
+        ),
+        final_prompt=final_text,
+    )
+    write_session(session, history_dir)
+
+
+class TestReplay:
+    """AC #3 (US-015) — load session, replay into new session, enter loop."""
+
+    def test_unknown_session_emits_not_found(
+        self, tmp_promptpal: dict[str, Path]
+    ) -> None:
         stderr = io.StringIO()
+        backend = FakeBackend(
+            [BackendResponse(text="unused", input_tokens=None, output_tokens=None)],
+        )
         rc = main(
-            ["--replay", "abc"],
+            ["--replay", "nope-not-here"],
             config_path=tmp_promptpal["config_path"],
             history_dir=tmp_promptpal["history_dir"],
             usage_log_path=tmp_promptpal["usage_log"],
+            stdin=io.StringIO("a\n"),
             stdout=io.StringIO(),
             stderr=stderr,
             detect_platform_fn=lambda: _fake_platform(
                 home=str(tmp_promptpal["home"])
             ),
+            backend_factory=lambda c, o, p: backend,
             skip_wsl_guard=True,
         )
         assert rc == EXIT_FAILURE
-        assert REPLAY_NOT_IMPLEMENTED in stderr.getvalue()
+        assert (
+            REPLAY_NOT_FOUND_TEMPLATE.format(session_id="nope-not-here")
+            in stderr.getvalue()
+        )
+
+    def test_session_with_no_assistant_turn_rejected(
+        self, tmp_promptpal: dict[str, Path]
+    ) -> None:
+        """A source session without any assistant turn is unreplayable.
+
+        The loop needs an ``initial_improved`` value to display; a
+        session where only the user spoke can't seed that.
+        """
+        bare_session = Session(
+            session_id="bare-source",
+            created_at="2026-05-15T12:00:00Z",
+            updated_at="2026-05-15T12:00:00Z",
+            status="discarded",
+            label=None,
+            original_prompt="just the original",
+            model="claude-sonnet-4-6",
+            backend="api-key",
+            turns=(
+                Turn(
+                    role="user",
+                    content="just the original",
+                    backend="api-key",
+                    input_tokens=None,
+                    output_tokens=None,
+                    timestamp="2026-05-15T12:00:00Z",
+                ),
+            ),
+            final_prompt=None,
+        )
+        write_session(bare_session, tmp_promptpal["history_dir"])
+        stderr = io.StringIO()
+        backend = FakeBackend([])  # never called
+        rc = main(
+            ["--replay", "bare-source"],
+            config_path=tmp_promptpal["config_path"],
+            history_dir=tmp_promptpal["history_dir"],
+            usage_log_path=tmp_promptpal["usage_log"],
+            stdin=io.StringIO("a\n"),
+            stdout=io.StringIO(),
+            stderr=stderr,
+            detect_platform_fn=lambda: _fake_platform(
+                home=str(tmp_promptpal["home"])
+            ),
+            backend_factory=lambda c, o, p: backend,
+            skip_wsl_guard=True,
+        )
+        assert rc == EXIT_FAILURE
+        assert (
+            REPLAY_EMPTY_TEMPLATE.format(session_id="bare-source")
+            in stderr.getvalue()
+        )
+
+    def test_replay_accept_writes_new_session(
+        self, tmp_promptpal: dict[str, Path]
+    ) -> None:
+        """Accepting the replay verbatim writes a NEW session, leaves source intact."""
+        _seed_replay_session(tmp_promptpal["history_dir"])
+        backend = FakeBackend([])  # accept-immediate path never calls backend
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        rc = main(
+            ["--replay", "replay-source-1"],
+            config_path=tmp_promptpal["config_path"],
+            history_dir=tmp_promptpal["history_dir"],
+            usage_log_path=tmp_promptpal["usage_log"],
+            stdin=io.StringIO("a\n"),  # accept on first choice
+            stdout=stdout,
+            stderr=stderr,
+            detect_platform_fn=lambda: _fake_platform(
+                home=str(tmp_promptpal["home"])
+            ),
+            backend_factory=lambda c, o, p: backend,
+            clock=_frozen_clock("2026-05-19T00:00:00Z"),
+            id_factory=lambda: "new-replay-id",
+            skip_wsl_guard=True,
+        )
+        assert rc == EXIT_OK, stderr.getvalue()
+
+        # Source file is untouched.
+        source_file = tmp_promptpal["history_dir"] / "replay-source-1.json"
+        assert source_file.exists()
+        source_data = json.loads(source_file.read_text(encoding="utf-8"))
+        assert source_data["session_id"] == "replay-source-1"
+        assert source_data["status"] == "accepted"
+
+        # A new session file was written under the injected id.
+        new_file = tmp_promptpal["history_dir"] / "new-replay-id.json"
+        assert new_file.exists(), "replay must write a fresh session file"
+        new_data = json.loads(new_file.read_text(encoding="utf-8"))
+        assert new_data["session_id"] == "new-replay-id"
+        # New session inherited the source's original_prompt and turns.
+        assert new_data["original_prompt"] == "the original prompt"
+        assert len(new_data["turns"]) == 2  # source's user + assistant
+        # Accept finalizes status + final_prompt.
+        assert new_data["status"] == "accepted"
+        assert new_data["final_prompt"] == "the prior improved text"
+
+        # The improved text is on stdout (default --output plain).
+        assert stdout.getvalue().strip() == "the prior improved text"
+
+    def test_replay_iterate_then_accept_appends_new_turns(
+        self, tmp_promptpal: dict[str, Path]
+    ) -> None:
+        """Iterating once during replay calls the backend with the full prior conversation."""
+        _seed_replay_session(tmp_promptpal["history_dir"])
+        backend = FakeBackend(
+            [
+                BackendResponse(
+                    text="refined further",
+                    input_tokens=20,
+                    output_tokens=40,
+                )
+            ],
+            name="api-key (claude-sonnet-4-6)",
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        rc = main(
+            ["--replay", "replay-source-1"],
+            config_path=tmp_promptpal["config_path"],
+            history_dir=tmp_promptpal["history_dir"],
+            usage_log_path=tmp_promptpal["usage_log"],
+            # Iterate, give feedback, accept.
+            stdin=io.StringIO("i\npush it harder\na\n"),
+            stdout=stdout,
+            stderr=stderr,
+            detect_platform_fn=lambda: _fake_platform(
+                home=str(tmp_promptpal["home"])
+            ),
+            backend_factory=lambda c, o, p: backend,
+            clock=_frozen_clock("2026-05-19T00:00:00Z"),
+            id_factory=lambda: "iter-replay-id",
+            skip_wsl_guard=True,
+        )
+        assert rc == EXIT_OK, stderr.getvalue()
+
+        # Backend was called once (the iterate) with 3 prior messages:
+        # the source's user turn + assistant turn + the new user feedback.
+        assert len(backend.calls) == 1
+        _system, messages = backend.calls[0]
+        assert len(messages) == 3
+        assert messages[0] == {"role": "user", "content": "the original prompt"}
+        assert messages[1] == {
+            "role": "assistant",
+            "content": "the prior improved text",
+        }
+        assert messages[2] == {"role": "user", "content": "push it harder"}
+
+        # New session reflects source's 2 turns + 2 new (user feedback + assistant).
+        new_file = tmp_promptpal["history_dir"] / "iter-replay-id.json"
+        new_data = json.loads(new_file.read_text(encoding="utf-8"))
+        assert len(new_data["turns"]) == 4
+        assert new_data["final_prompt"] == "refined further"
+        assert stdout.getvalue().strip() == "refined further"
+
+    def test_replay_discard_writes_discarded_status(
+        self, tmp_promptpal: dict[str, Path]
+    ) -> None:
+        _seed_replay_session(tmp_promptpal["history_dir"])
+        backend = FakeBackend([])  # discard path doesn't call backend
+        stdout = io.StringIO()
+        rc = main(
+            ["--replay", "replay-source-1"],
+            config_path=tmp_promptpal["config_path"],
+            history_dir=tmp_promptpal["history_dir"],
+            usage_log_path=tmp_promptpal["usage_log"],
+            stdin=io.StringIO("d\n"),
+            stdout=stdout,
+            stderr=io.StringIO(),
+            detect_platform_fn=lambda: _fake_platform(
+                home=str(tmp_promptpal["home"])
+            ),
+            backend_factory=lambda c, o, p: backend,
+            clock=_frozen_clock("2026-05-19T00:00:00Z"),
+            id_factory=lambda: "discard-replay-id",
+            skip_wsl_guard=True,
+        )
+        assert rc == EXIT_OK  # discard is EXIT_DISCARDED == EXIT_OK
+        new_file = tmp_promptpal["history_dir"] / "discard-replay-id.json"
+        new_data = json.loads(new_file.read_text(encoding="utf-8"))
+        assert new_data["status"] == "discarded"
+        # Discarded → no stdout output (the user dropped the result).
+        assert stdout.getvalue() == ""
+
+    def test_replay_name_sets_label_on_new_session(
+        self, tmp_promptpal: dict[str, Path]
+    ) -> None:
+        """--name LABEL during --replay lands on the NEW session, not the source.
+
+        AC #4: ``--name LABEL`` assigns a human-readable label recorded
+        in both the session file and the index entry.
+        """
+        _seed_replay_session(tmp_promptpal["history_dir"])
+        backend = FakeBackend([])
+        rc = main(
+            ["--replay", "replay-source-1", "--name", "tagged replay"],
+            config_path=tmp_promptpal["config_path"],
+            history_dir=tmp_promptpal["history_dir"],
+            usage_log_path=tmp_promptpal["usage_log"],
+            stdin=io.StringIO("a\n"),
+            stdout=io.StringIO(),
+            stderr=io.StringIO(),
+            detect_platform_fn=lambda: _fake_platform(
+                home=str(tmp_promptpal["home"])
+            ),
+            backend_factory=lambda c, o, p: backend,
+            clock=_frozen_clock("2026-05-19T00:00:00Z"),
+            id_factory=lambda: "named-replay-id",
+            skip_wsl_guard=True,
+        )
+        assert rc == EXIT_OK
+
+        # Source session label NOT mutated.
+        source_data = json.loads(
+            (tmp_promptpal["history_dir"] / "replay-source-1.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert source_data["label"] is None
+
+        # New session carries the label.
+        new_data = json.loads(
+            (tmp_promptpal["history_dir"] / "named-replay-id.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert new_data["label"] == "tagged replay"
+
+        # Index entry also has the label.
+        index = json.loads(
+            (tmp_promptpal["history_dir"] / "index.json").read_text(encoding="utf-8")
+        )
+        new_entry = next(
+            e for e in index if e["session_id"] == "named-replay-id"
+        )
+        assert new_entry["label"] == "tagged replay"
+
+
+    def test_replay_quiet_does_not_short_circuit_loop(
+        self, tmp_promptpal: dict[str, Path]
+    ) -> None:
+        """--quiet --replay enters the loop; closed stdin → discard (no surprises).
+
+        ``--quiet`` only short-circuits the first-turn pipeline. Replay
+        always enters the loop so the user can iterate or accept. An
+        empty stdin signals EOF, which the loop maps to STATUS_DISCARDED
+        — that's the safe path, not a silent accept.
+        """
+        _seed_replay_session(tmp_promptpal["history_dir"])
+        backend = FakeBackend([])
+        stdout = io.StringIO()
+        rc = main(
+            ["--quiet", "--replay", "replay-source-1"],
+            config_path=tmp_promptpal["config_path"],
+            history_dir=tmp_promptpal["history_dir"],
+            usage_log_path=tmp_promptpal["usage_log"],
+            stdin=io.StringIO(""),  # immediate EOF
+            stdout=stdout,
+            stderr=io.StringIO(),
+            detect_platform_fn=lambda: _fake_platform(
+                home=str(tmp_promptpal["home"])
+            ),
+            backend_factory=lambda c, o, p: backend,
+            clock=_frozen_clock("2026-05-19T00:00:00Z"),
+            id_factory=lambda: "eof-replay-id",
+            skip_wsl_guard=True,
+        )
+        assert rc == EXIT_OK  # discard is EXIT_DISCARDED == EXIT_OK
+        new_data = json.loads(
+            (tmp_promptpal["history_dir"] / "eof-replay-id.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert new_data["status"] == "discarded"
+        # Discarded → no stdout output.
+        assert stdout.getvalue() == ""
+
+
+class TestNameLabel:
+    """AC #4 — --name LABEL on a normal first-turn run.
+
+    The replay-side coverage of --name lives in ``TestReplay`` above;
+    here we pin the non-replay path so --name keeps working everywhere
+    a session is born.
+    """
+
+    def test_name_writes_label_into_session_file(
+        self, tmp_promptpal: dict[str, Path]
+    ) -> None:
+        backend = FakeBackend(
+            [BackendResponse(text="improved", input_tokens=None, output_tokens=None)],
+            name="claude-cli",
+        )
+        rc = main(
+            ["--quiet", "raw prompt", "--name", "my-label"],
+            config_path=tmp_promptpal["config_path"],
+            history_dir=tmp_promptpal["history_dir"],
+            usage_log_path=tmp_promptpal["usage_log"],
+            stdin=io.StringIO(""),
+            stdout=io.StringIO(),
+            stderr=io.StringIO(),
+            detect_platform_fn=lambda: _fake_platform(
+                home=str(tmp_promptpal["home"])
+            ),
+            backend_factory=lambda c, o, p: backend,
+            clock=_frozen_clock("2026-05-19T00:00:00Z"),
+            id_factory=lambda: "named-sess-id",
+            skip_wsl_guard=True,
+        )
+        assert rc == EXIT_OK
+        new_data = json.loads(
+            (tmp_promptpal["history_dir"] / "named-sess-id.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert new_data["label"] == "my-label"
+
+        index = json.loads(
+            (tmp_promptpal["history_dir"] / "index.json").read_text(encoding="utf-8")
+        )
+        assert index[0]["label"] == "my-label"
 
 
 # ===========================================================================

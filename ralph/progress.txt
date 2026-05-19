@@ -156,6 +156,30 @@ Started: 2026-05-18
   ('stdlib only') extends from runtime to test layer. If a future
   manifest needs nested mappings the parser doesn't cover, prefer
   growing the walker over adding PyYAML.
+- bash (Yn) prompt convention: ``case "$answer" in ""|y|Y) remove ;;
+  *) keep ;; esac``. Empty input + ``y`` + ``Y`` are the YES branch
+  (the literal ``Y`` in ``(Yn)`` advertises ENTER-defaults-yes), and
+  EVERY other value — including ``n``/``N``, typos, AND EOF — falls
+  through to the SAFE keep branch. Pair with ``read -r answer ||
+  answer="__EOF__"`` so a closed stdin can't infinite-loop on read
+  failure under ``set -e``. Tested by writing literal ``""`` /
+  ``"y\n"`` / ``"n\n"`` / ``"qq\n"`` / ``"\n"`` (default-yes) to
+  subprocess.run's ``input=`` kwarg.
+- The --replay path in core/cli.py is a sibling of _run_pipeline,
+  not a wrapper around it: cmd_replay() loads the source session
+  read-only, builds a fresh Session with new_session() under a NEW
+  id, folds in the source's turns via append_turn (preserving each
+  turn's ORIGINAL backend / token counts — those describe what
+  originally produced the turn, not the replay backend), then
+  enters run_refinement_loop with the seeded messages +
+  initial_improved. The source file on disk is byte-untouched. The
+  new session's label comes from --name LABEL (override) — the
+  source's label is intentionally NOT copied because replay is a
+  NEW line of refinement, not a continuation. Three failure modes
+  with distinct canonical messages: REPLAY_NOT_FOUND_TEMPLATE,
+  REPLAY_EMPTY_TEMPLATE (no assistant turn = no initial_improved
+  for the loop to display), and 'Error: could not read session...'
+  for JSON/IO errors.
 
 ---
 
@@ -1002,5 +1026,88 @@ Started: 2026-05-18
     stdlib-only NFR-11 line. If a future manifest grows nested
     mappings the walker can't handle, grow the walker — don't
     reach for PyYAML.
+
+---
+
+## 2026-05-19 - US-015
+- uninstall.sh NEW (repo root, executable): bash script duplicating
+  install.sh's shape — WSL HOME guard mirroring WSL_LAUNCH_FIX_MESSAGE
+  line-by-line, $INSTALL_DIR / $PROMPTPAL_HOME env overrides for
+  parity, --help / --purge flag handling, missing-target paths are
+  informational (not errors).
+- core/cli.py CHANGED: cmd_replay() NEW (~110 lines below the
+  cmd_update_system_prompt block); main() dispatch wired AFTER
+  backend resolution (replay needs a real backend for iterate). Two
+  new canonical messages — REPLAY_NOT_FOUND_TEMPLATE,
+  REPLAY_EMPTY_TEMPLATE — replace the deleted REPLAY_NOT_IMPLEMENTED
+  stub. UNINSTALL_NOT_IMPLEMENTED was kept but REPURPOSED: it no
+  longer says 'not implemented in this build' — it points the user
+  at `bash uninstall.sh [--purge]` because the Python process can't
+  delete itself mid-run.
+- AC #1 / AC #2 (P1-INST-07): test_uninstall.py NEW (~24 tests).
+  Drift-fence on WSL message via WSL_LAUNCH_FIX_MESSAGE.splitlines()
+  iteration. (Yn) semantics pinned by 5 separate tests: ENTER /
+  'y' / 'Y' / 'n' / 'qq' / EOF — each covers one branch of the
+  case statement. The unrecognized-input branch ALWAYS keeps data
+  (safe default — typos don't wipe history). --purge bypass tested
+  with stdin closed.
+- AC #3 (--replay SESSION_ID): test_cli.py adds TestReplay class
+  with 6 tests covering: unknown session, no-assistant-turn session,
+  accept-verbatim (no backend call), iterate-then-accept (backend
+  receives 3+ prior messages on first call), discard (status =
+  discarded, no stdout), --quiet --replay (loop entered, EOF stdin
+  → discard). The source session file is verified byte-untouched
+  in every test — replay is a strict read-only-of-source operation.
+- AC #4 (--name LABEL): TestNameLabel class verifies the label
+  flows into BOTH the session file AND the index entry, both for
+  normal first-turn runs and for --replay. On replay, the source's
+  label is NOT copied — replay is a new line of refinement, so
+  --name overrides cleanly (or stays None if --name is absent).
+- AC #5: test_shellcheck_uninstall_sh_clean — same skipif pattern
+  as install.sh's. AC #6 / AC #7: pytest + pyright both clean.
+- Files changed: uninstall.sh (NEW), core/cli.py (cmd_replay NEW,
+  main() dispatch wired, UNINSTALL_NOT_IMPLEMENTED repurposed,
+  REPLAY_NOT_IMPLEMENTED removed in favor of two specific
+  templates), tests/unit/test_uninstall.py (NEW, 24 tests),
+  tests/unit/test_cli.py (2 stub tests replaced with 8 new
+  comprehensive tests), ralph/prd.json (US-015 -> passes: true),
+  ralph/progress.txt.
+- Full project 608 passed + 2 skipped (was 578+2 before US-015);
+  pyright clean; coverage 95% across core/ (core/cli.py 85% — the
+  15% gap is defensive error-handling branches in cmd_replay that
+  mirror existing uncovered paths in _run_pipeline).
+- **Learnings for future iterations:**
+  - The 'safe default for unrecognized input' rule for destructive
+    bash prompts: ``case $answer in ""|y|Y) destroy ;; *) keep ;;``
+    means typos, EOF, 'n', and unknown answers ALL preserve data.
+    Pair with ``read -r answer || answer="__EOF__"`` under set -e
+    so a closed stdin doesn't abort the script. Pin every branch
+    with one test apiece. This is more conservative than ``y/n``
+    matchers that fall back to a destructive default — the PRD
+    spec said (Yn) so the LITERAL Yes-on-ENTER branch is honored,
+    but everything else fails safe.
+  - --replay is structurally a sibling of _run_pipeline, NOT a
+    wrapper around it. The pipeline's read_prompt() / first
+    backend.complete() steps are replaced by load_session() +
+    seed messages from saved turns. Extracting a common
+    'enter_loop_with_seeded_messages' helper looked tempting but
+    every shared step has subtly different shape: the pipeline
+    persists --backend on first successful turn (replay doesn't —
+    persistence belongs to the original story), the pipeline runs
+    a system-prompt seed (replay assumes it's already there since
+    the source session existed), and the pipeline's --quiet path
+    short-circuits the loop (replay never short-circuits). Two
+    cohesive functions beat one parameterized abstraction here.
+  - When a turn is replayed into a new session, copy each turn's
+    ORIGINAL ``backend`` and token counts via append_turn — those
+    fields describe the historical record. Don't rewrite them with
+    the replay backend's name; the index's ``backend`` field carries
+    that new-session info instead.
+  - The UNINSTALL_NOT_IMPLEMENTED constant pattern: when a CLI flag
+    deliberately delegates to a sibling tool (bash script,
+    external binary), the canonical message stays but its TEXT
+    changes from 'not implemented' to a redirect. Tests pin the
+    new text. Same shape will apply if a future story moves
+    --status or --update-system-prompt to a sub-binary.
 
 ---
