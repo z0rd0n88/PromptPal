@@ -26,3 +26,6 @@ Thumbs.db
 
 # Ralph iteration helper (per-iteration test/typecheck launcher)
 .ralph-runner.sh
+
+# Vendored ralph clone (downloaded locally, not part of project history)
+scripts/ralph/
