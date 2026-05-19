@@ -11,7 +11,62 @@ Started: 2026-05-18
 - All on-disk text is UTF-8 with LF endings (`newline="\n"` on text writes).
 - preferred_backend is normalized through `normalize_preferred_backend()` at
   every entry point so a stale/corrupt value can never crash startup.
+- Backend implementations inject their external dependency via a single
+  `runner`/`transport` kwarg (ApiBackend → urllib transport; CliBackend →
+  subprocess runner). Tests substitute a programmable Fake; production uses the
+  module-level default. Keep this pattern when adding US-006+ resolve_backend.
+- Subprocess-style backends translate FileNotFoundError → a typed `*NotFoundError`
+  carrying the canonical SPEC §12 message; the CLI surface prints that message
+  verbatim. Tests pin the message string so accidental drift breaks the suite.
+- The Windows MSIX-launched session writes to WSL via UNC paths; pytest/pyright
+  must run under WSL via uv. `.ralph-runner.sh` (gitignored) wraps the uv calls
+  for each iteration: `bash .ralph-runner.sh test|typecheck|cov`.
 
+---
+
+## 2026-05-19 - US-005
+- core/cli_backend.py: CliBackend (Backend subclass) invoking
+  `claude --print --model <m> --bare --system-prompt-file <path>
+  --input-format=stream-json --output-format=stream-json`, with messages array
+  piped to stdin as NDJSON. Error hierarchy CliError/CliAuthError/
+  CliNotFoundError/CliInvocationError. Canonical-message constants
+  AUTH_ERROR_MESSAGE, CLI_NOT_FOUND_MESSAGE, AUTH_FAILURE_KEYWORDS,
+  STREAM_JSON_FLAGS. _parse_stream_json supports both the canonical
+  {type:assistant,...} envelope and the {type:content_block_delta,...} shape.
+- Each CLI turn carries input_tokens=None, output_tokens=None (P1-BKND-10).
+- check_auth() runs `claude --version`; False on any non-zero / missing binary.
+- System prompt written to a 0600 mkstemp tempfile per call; cleaned up in a
+  finally block even when the runner raises.
+- Subprocess layer injected via a `runner` kwarg (Callable → _CliRunResult);
+  default uses subprocess.run, translating FileNotFoundError → CliNotFoundError.
+- 60 new tests in tests/unit/test_cli_backend_streamjson.py (matches US-016's
+  P1-BKND-03 mapping). Full project 186 tests pass; pyright clean; 98% coverage
+  on core/cli_backend.py (97% across core/).
+- Files changed: core/cli_backend.py (NEW),
+  tests/unit/test_cli_backend_streamjson.py (NEW), .gitignore (add
+  .ralph-runner.sh), ralph/prd.json (US-005 → passes: true), ralph/progress.txt.
+- **Learnings for future iterations:**
+  - The "Human:" literal regression bait (AC-MT-01) is a structural property of
+    stream-json — every message rides as its own NDJSON object, so the role
+    boundary is byte-explicit. The test that pins this verifies the user content
+    survives `json.loads` byte-identical; future backends that flatten messages
+    would break this test loudly.
+  - `--output-format=stream-json` events from claude are NDJSON; the parser
+    treats them as line-delimited and skips both unparseable lines and blank
+    lines. Future claude versions may add new envelope types — keep the
+    extractor permissive (return [] on unknown type, never raise).
+  - PRD-PHASE1.md is the authoritative spec, NOT SPEC.md (which isn't in the
+    repo). The §14 amendment table is where the actual SPEC deltas live —
+    consult it before implementing anything where US-001/US-002 notes mention a
+    "SPEC delta" without a fully-merged spec available.
+  - The runner is invoked with a `system_prompt_path` tempfile that exists
+    only during the call. Tests that need to verify the file's content must do
+    so inside the fake runner (the file is unlinked in the finally block before
+    the test gets control back).
+  - When using `uv run --with X` the ephemeral env is cached but separate per
+    package set. Running pyright in one env then tests in another is fine for
+    speed but means pyright must include `pytest` in its --with list, otherwise
+    test files report spurious `Import "pytest" could not be resolved` errors.
 ---
 
 ## 2026-05-18 - US-001
