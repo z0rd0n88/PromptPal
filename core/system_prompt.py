@@ -60,14 +60,13 @@ complete — never a half-written file (NFR-04).
 from __future__ import annotations
 
 import hashlib
-import os
 import shutil
-import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Callable
 
+from core._io import atomic_write_bytes
 from core.config import Config
 
 
@@ -277,23 +276,14 @@ def _parse_sidecar(raw: bytes) -> str:
 
 
 def _atomic_write_bytes(target: Path, payload: bytes) -> None:
-    """Same atomic pattern as :func:`core.config.save_config`, for bytes."""
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=".system-prompt-", suffix=".md", dir=str(target.parent)
+    """Delegate to :func:`core._io.atomic_write_bytes` with module-specific
+    tempfile prefix/suffix. Kept as a thin wrapper because tests import
+    this symbol directly to smoke-test the helper from inside this
+    module's namespace.
+    """
+    atomic_write_bytes(
+        target, payload, prefix=".system-prompt-", suffix=".md"
     )
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(payload)
-        os.replace(tmp_path, target)
-    except Exception:
-        if tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
-        raise
 
 
 def update_system_prompt(

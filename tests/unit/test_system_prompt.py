@@ -464,7 +464,7 @@ def test_update_writes_atomically_via_temp_and_replace(tmp_path, monkeypatch):
         replace_calls.append((str(src), str(dst)))
         return real_replace(src, dst, *args, **kwargs)
 
-    monkeypatch.setattr("core.system_prompt.os.replace", tracking_replace)
+    monkeypatch.setattr("core._io.os.replace", tracking_replace)
 
     payload = b"NEW\n"
     url = "https://example.invalid/system-prompt.txt"
@@ -491,7 +491,7 @@ def test_update_cleans_up_tempfile_on_write_failure(tmp_path, monkeypatch):
     def boom(*args, **kwargs):
         raise OSError("disk full")
 
-    monkeypatch.setattr("core.system_prompt.os.replace", boom)
+    monkeypatch.setattr("core._io.os.replace", boom)
 
     payload = b"NEW\n"
     url = "https://example.invalid/system-prompt.txt"
