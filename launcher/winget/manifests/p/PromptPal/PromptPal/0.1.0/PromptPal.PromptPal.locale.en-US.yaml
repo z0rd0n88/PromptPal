@@ -1,0 +1,31 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+#
+# PromptPal default-locale manifest (Phase 1).
+
+PackageIdentifier: PromptPal.PromptPal
+PackageVersion: 0.1.0
+PackageLocale: en-US
+Publisher: PromptPal
+PublisherUrl: https://github.com/z0rd0n88/PromptPal
+PublisherSupportUrl: https://github.com/z0rd0n88/PromptPal/issues
+PackageName: PromptPal
+PackageUrl: https://github.com/z0rd0n88/PromptPal
+License: MIT
+LicenseUrl: https://github.com/z0rd0n88/PromptPal/blob/main/LICENSE
+ShortDescription: Improve prompts via Claude CLI or Anthropic API from the terminal.
+Description: |
+  PromptPal is a bash + Python3 CLI that rewrites prompts via Claude CLI
+  or the Anthropic Messages API. The Windows package installs a thin
+  launcher that forwards all arguments into WSL Ubuntu, where the actual
+  PromptPal binary lives. Install PromptPal inside WSL Ubuntu separately
+  via the upstream install.sh script. The launcher prints a hint and
+  exits 1 when WSL Ubuntu is not present.
+Tags:
+  - cli
+  - prompt-engineering
+  - anthropic
+  - claude
+  - wsl
+Moniker: promptpal
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

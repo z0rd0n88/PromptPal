@@ -1,0 +1,32 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+#
+# PromptPal installer manifest (Phase 1, D-5).
+#
+# Distributes the Windows launcher as a portable archive. winget drops
+# promptpal.cmd on the user's PATH via PortableCommandAlias. The
+# launcher contains no Anthropic logic; it forwards args to the WSL
+# Ubuntu `promptpal` binary (NFR-12).
+#
+# Replace InstallerUrl/InstallerSha256 with the actual release artifact
+# values when cutting a tagged release. The zero-hash placeholder below
+# is intentionally invalid so an accidental publish fails fast.
+
+PackageIdentifier: PromptPal.PromptPal
+PackageVersion: 0.1.0
+MinimumOSVersion: 10.0.19041.0
+Platform:
+  - Windows.Desktop
+InstallModes:
+  - silent
+  - silentWithProgress
+Installers:
+  - Architecture: x64
+    InstallerType: zip
+    NestedInstallerType: portable
+    InstallerUrl: https://github.com/z0rd0n88/PromptPal/releases/download/v0.1.0/promptpal-launcher-0.1.0.zip
+    InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
+    NestedInstallerFiles:
+      - RelativeFilePath: promptpal.cmd
+        PortableCommandAlias: promptpal
+ManifestType: installer
+ManifestVersion: 1.6.0

@@ -138,6 +138,24 @@ Started: 2026-05-18
   the binary is absent so the suite still passes on hosts without
   shellcheck installed (CI must install it explicitly to enforce the
   contract).
+- The Windows launcher (launcher/promptpal.{cmd,ps1}) follows the
+  same drift-fence pattern as bin/promptpal: canonical user-visible
+  strings live as Python constants in core/winget_launcher.py
+  (WSL_UBUNTU_MISSING_MESSAGE, WSL_FORWARD_COMMAND); tests pin both
+  the launcher script copies AND launcher/README.md against them so
+  editing one without the other fails. .cmd shim is what winget
+  aliases to `promptpal` on PATH; it just runs powershell with
+  -ExecutionPolicy Bypass against the .ps1 (PowerShell auto-decodes
+  wsl.exe's UTF-16-LE output, cmd.exe cannot). Real Windows-host
+  smoke tests live in tests/integration/test_winget_launcher.py and
+  are skipped unless WSL_INTEGRATION=1; unit tests in
+  tests/unit/test_winget_launcher.py pin file contents + manifest
+  YAML for every host that can't run PowerShell.
+- YAML parsing in tests is dependency-free — a small _yaml_scalar
+  walker handles the manifests' simple key:value subset so NFR-11
+  ('stdlib only') extends from runtime to test layer. If a future
+  manifest needs nested mappings the parser doesn't cover, prefer
+  growing the walker over adding PyYAML.
 
 ---
 
@@ -872,4 +890,117 @@ Started: 2026-05-18
     high-value assertions (argv shim, exit-code propagation,
     prefix-not-substring) rather than duplicating. The Ralph harness
     sometimes regenerates exploratory files between iterations.
+---
+
+## 2026-05-19 - US-014
+- launcher/promptpal.cmd NEW: thin Windows shim — winget aliases this
+  to `promptpal` on PATH; one line of real work (`powershell.exe
+  -NoLogo -NoProfile -ExecutionPolicy Bypass -File promptpal.ps1 %*`).
+  No WSL detection here because cmd.exe sees wsl.exe's UTF-16-LE
+  output as byte garbage; detection lives in the .ps1.
+- launcher/promptpal.ps1 NEW: real launcher logic. Runs
+  `wsl.exe --list --quiet` (PowerShell auto-decodes UTF-16-LE);
+  scans output for /^\s*Ubuntu/ (matches Ubuntu, Ubuntu-22.04,
+  Ubuntu-24.04, etc.); on miss writes WSL_UBUNTU_MISSING_MESSAGE to
+  stderr via [Console]::Error.WriteLine and exits 1; on hit forwards
+  via `& wsl.exe -d Ubuntu -- promptpal @args` and propagates exit
+  code via `exit $LASTEXITCODE`. Contains zero Anthropic logic.
+- launcher/winget/manifests/p/PromptPal/PromptPal/0.1.0/ NEW:
+  three-file multi-manifest set at schema v1.6.0. Version manifest
+  declares DefaultLocale=en-US + ManifestType=version. Installer
+  manifest is InstallerType=zip + NestedInstallerType=portable +
+  RelativeFilePath=promptpal.cmd + PortableCommandAlias=promptpal;
+  zero-hash SHA256 placeholder intentionally fails a publish without
+  manual rewrite. Locale manifest carries License=MIT, the upstream
+  GitHub URLs, and Tags including `wsl` for discoverability.
+- launcher/README.md NEW: documents the launcher's contract +
+  release process (zip launcher files, rewrite InstallerSha256,
+  bump PackageVersion in all three manifests, `winget validate`).
+- core/winget_launcher.py NEW: canonical constants module
+  (WSL_UBUNTU_MISSING_MESSAGE, WSL_FORWARD_COMMAND,
+  WINGET_PACKAGE_IDENTIFIER, WINGET_PACKAGE_VERSION,
+  WINGET_MANIFEST_VERSION) + path helpers (PROMPTPAL_CMD_PATH,
+  PROMPTPAL_PS1_PATH, WINGET_MANIFEST_DIR). Tests pin both the .ps1
+  script AND the README verbatim against the constants — drift
+  fence inherits the US-012 pattern of bin/promptpal vs
+  core.platform.WSL_LAUNCH_FIX_MESSAGE.
+- AC #1 / AC-WINGET-01: test_ps1_emits_install_message_when_ubuntu_
+  missing + test_ps1_exits_1_when_ubuntu_missing pin both the text
+  and the exit-1 branch via a regex that requires the message to
+  precede the `exit 1` statement in the script body.
+- AC #2 / AC-WINGET-02: test_ps1_forwards_via_wsl_d_ubuntu pins
+  WSL_FORWARD_COMMAND ('wsl.exe -d Ubuntu -- promptpal') in the
+  .ps1; test_ps1_forwards_args_with_splat pins '@args' so a future
+  edit that drops the splat fails the test.
+- AC #3: test_no_anthropic_logic_in_executable_launcher_files walks
+  every .cmd/.ps1/.bat/.exe/.py/.json/.yaml/.yml under launcher/ and
+  rejects ANTHROPIC_API_KEY / anthropic.com / x-api-key / claude-*
+  model names. Markdown is exempt — launcher/README.md *names* the
+  env var to document what the launcher refuses to read.
+- AC #4: test_version_manifest_fields / test_installer_manifest_
+  fields / test_locale_manifest_fields verify ManifestType +
+  ManifestVersion + per-file required keys.
+  test_manifests_share_identity asserts all three files agree on
+  PackageIdentifier + PackageVersion; test_manifest_directory_layout
+  asserts the publisher/package/version path layout winget validate
+  expects; test_installer_url_matches_version pins `v0.1.0` +
+  `-0.1.0.zip` in the InstallerUrl so a stale URL fails CI on the
+  next version bump.
+- AC #5 / AC-WINGET-02 smoke: tests/integration/test_winget_
+  launcher.py NEW carries the PRD §10-mandated WSL_INTEGRATION=1
+  smoke tests. Without that env var set, pytestmark =
+  pytest.mark.skipif skips the whole module — verified in the suite
+  report (578 passed, 2 skipped).
+- YAML parsing is dependency-free via the _yaml_scalar walker in
+  the test file (handles any-indent key:value lines without
+  PyYAML), preserving NFR-11 'stdlib only' at the test layer.
+- 29 new unit tests in tests/unit/test_winget_launcher.py +
+  2 integration tests in tests/integration/test_winget_launcher.py.
+  Full project 578 tests pass + 2 skip (was 549 before US-014);
+  pyright clean; coverage 96% across core/ (core/winget_launcher.py
+  100% — all constants/paths exercised at import + assertion time).
+- Files changed: launcher/promptpal.cmd (NEW),
+  launcher/promptpal.ps1 (NEW), launcher/README.md (NEW),
+  launcher/winget/manifests/p/PromptPal/PromptPal/0.1.0/
+  PromptPal.PromptPal.yaml (NEW), .../PromptPal.PromptPal.
+  installer.yaml (NEW), .../PromptPal.PromptPal.locale.en-US.yaml
+  (NEW), core/winget_launcher.py (NEW),
+  tests/unit/test_winget_launcher.py (NEW),
+  tests/integration/test_winget_launcher.py (NEW),
+  ralph/prd.json (US-014 -> passes: true), ralph/progress.txt.
+- **Learnings for future iterations:**
+  - For Windows tooling that emits UTF-16-LE (wsl.exe, certain
+    Powershell cmdlets when piped), keep the detection logic in
+    PowerShell — its call operator decodes transparently. cmd.exe
+    sees byte garbage and you'd need an iconv/find /v workaround
+    that breaks on locale changes. The split here (.cmd shim +
+    .ps1 logic) is the cleanest way to satisfy both 'winget puts
+    something on PATH' and 'detection needs proper Unicode handling'.
+  - winget v1.6.0 manifest sets are three files in lockstep on
+    PackageIdentifier + PackageVersion. If a future ralph iteration
+    bumps the version, all three files MUST be edited in the same
+    commit AND the directory name (.../<version>/) must move.
+    test_manifests_share_identity + test_installer_url_matches_
+    version are the drift fences that catch a half-bump.
+  - The 'zero-hash placeholder' pattern (all-zeros SHA256 in the
+    installer manifest) is a deliberate publish-time fail-fast:
+    `winget validate` accepts it (64 hex chars passes the schema)
+    but anyone actually publishing without rewriting the hash gets
+    a download-integrity error from winget itself. Same shape as
+    the 'zero-hash for unset SBOM digest' pattern used elsewhere.
+  - When the AC mentions multiple alternatives ("promptpal.exe OR
+    promptpal.bat OR promptpal.ps1"), pick the simplest that
+    satisfies *all* downstream constraints. Here .ps1 alone is
+    insufficient because winget portable installers want a .cmd /
+    .exe entry point, and .cmd alone is insufficient because of
+    the UTF-16 wsl.exe output. Two files (.cmd + .ps1) is the
+    minimum that satisfies both.
+  - YAML parsing in tests doesn't need PyYAML when the manifests
+    use a constrained subset (top-level or indented key:value
+    pairs, simple - lists, scalar values). A 10-line _yaml_scalar
+    walker covers the assertions needed without crossing the
+    stdlib-only NFR-11 line. If a future manifest grows nested
+    mappings the walker can't handle, grow the walker — don't
+    reach for PyYAML.
+
 ---

@@ -1,0 +1,12 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.1.6.0.schema.json
+#
+# PromptPal version manifest (Phase 1).
+#
+# This manifest is the entry point that ties together the installer and
+# locale manifests below. winget validate parses all three together.
+
+PackageIdentifier: PromptPal.PromptPal
+PackageVersion: 0.1.0
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.6.0
