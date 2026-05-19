@@ -1192,8 +1192,8 @@ def main(
     )
 
 
-# Provide ``python -m core.cli`` ergonomics. The bin/ bash entrypoint
-# (US-012) will call ``python -m core.main`` once US-012 lands; until
-# then, ``python -m core.cli`` is the direct invocation.
+# ``python -m core.cli`` ergonomics — kept for direct debugging.
+# Production entry is ``python -m core.main`` via the bin/promptpal
+# launcher (US-012).
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(main())
