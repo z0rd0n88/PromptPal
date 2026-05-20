@@ -4,14 +4,13 @@ This module implements :class:`CliBackend`, the subprocess-based backend
 that invokes the locally installed ``claude`` CLI using its native
 ``--input-format=stream-json`` / ``--output-format=stream-json`` pipe.
 
-The full command vector (per D-10) is::
+The full command vector is::
 
-    claude --print --model <m> --bare \\
+    claude --print --model <m> \\
            --system-prompt-file <path> \\
            --input-format=stream-json --output-format=stream-json \\
            --verbose
 
-``--bare`` strips Claude Code chrome from the output and
 ``--system-prompt-file`` lets the system prompt live as a real file (we
 write the ``system`` argument to a 0600 tempfile per call and clean up
 afterwards). ``--verbose`` is mandated by the Claude CLI when ``--print``
@@ -20,6 +19,22 @@ is combined with ``--output-format=stream-json``; the CLI exits 1 with
 not add stderr chatter — the extra detail rides on the stream-json event
 channel, where :func:`_extract_text_from_event` already ignores
 non-``assistant`` event types by design.
+
+``--bare`` was originally specified by PRD D-10 to strip Claude Code
+chrome from output, but the Claude CLI implementation couples ``--bare``
+to authentication: with ``--bare`` set, ``Anthropic auth is strictly
+ANTHROPIC_API_KEY or apiKeyHelper via --settings (OAuth and keychain
+are never read)``. That breaks the primary auto-detect path (a user
+who ran ``claude auth login`` and has no ``ANTHROPIC_API_KEY`` exported
+hits a synthetic ``"Not logged in"`` stream-json reply with exit 0). We
+therefore omit ``--bare``: the extra ``system``/``rate_limit_event``
+envelopes that come back are ignored by :func:`_extract_text_from_event`
+on the read side, so output parsing is unaffected. The trade-off is
+that the user's Claude Code hooks, plugin sync, and CLAUDE.md
+auto-discovery run on every PromptPal call. Users who want the
+``--bare`` perf path can route through :class:`ApiBackend` instead by
+exporting ``ANTHROPIC_API_KEY`` and running with
+``promptpal --backend api-key`` (which persists the preference).
 
 The ``messages`` array is fed to ``claude`` as NDJSON on **stdin**; the
 assistant response is reassembled from ``assistant`` events on
@@ -210,33 +225,48 @@ def _is_auth_failure(stderr_text: str) -> bool:
 
 
 def _serialize_messages_ndjson(messages: Sequence[dict[str, Any]]) -> bytes:
-    """Encode ``messages`` as NDJSON (one JSON object per line, UTF-8, LF).
+    """Encode ``messages`` as NDJSON in Claude Code's stream-json input shape.
 
-    Empty list → empty bytes. A trailing newline is appended so the
-    final object terminates cleanly when ``claude`` reads stdin
-    line-by-line.
+    The Claude CLI's ``--input-format=stream-json`` expects each line to
+    be an envelope::
+
+        {"type": "user"|"assistant", "message": {"role": ..., "content": ...}}
+
+    not a bare ``{"role": ..., "content": ...}``. The unwrapped shape is
+    silently ignored — claude exits 0 after running its hooks but never
+    calls the model, producing a stream of ``system`` events and no
+    ``assistant`` reply. Empirically reproduced against
+    ``claude-code 2.1.143``.
+
+    Each input ``m`` (PromptPal's internal Messages-API-style shape) is
+    wrapped as ``{"type": m["role"], "message": m}``. Empty list → empty
+    bytes. A trailing newline is appended so the final object terminates
+    cleanly when ``claude`` reads stdin line-by-line.
     """
     if not messages:
         return b""
-    lines = [json.dumps(m, ensure_ascii=False) for m in messages]
+    wrapped = [{"type": m["role"], "message": m} for m in messages]
+    lines = [json.dumps(w, ensure_ascii=False) for w in wrapped]
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
 def _build_argv(
     executable: str, model: str, system_prompt_path: str
 ) -> list[str]:
-    """Build the full ``claude`` argv per D-10.
+    """Build the full ``claude`` argv.
 
-    The order matches the PRD literal so :func:`re`-style scrubbers can
-    pin it: ``--print --model <m> --bare --system-prompt-file <p>
+    Order: ``--print --model <m> --system-prompt-file <p>
     --input-format=stream-json --output-format=stream-json --verbose``.
+
+    Note: PRD D-10 originally specified ``--bare`` in this slot; it was
+    removed because the Claude CLI couples ``--bare`` to API-key-only
+    auth (see module docstring).
     """
     return [
         executable,
         "--print",
         "--model",
         model,
-        "--bare",
         "--system-prompt-file",
         system_prompt_path,
         *STREAM_JSON_FLAGS,

@@ -188,21 +188,27 @@ def test_constructor_does_not_invoke_runner() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_argv_has_all_required_flags_in_d10_order(make_backend) -> None:
-    """D-7 + D-10 command vector, in the exact PRD-quoted order."""
+def test_argv_has_all_required_flags_in_order(make_backend) -> None:
+    """Pinned argv shape.
+
+    PRD D-10 originally included ``--bare`` at argv[4], but ``--bare``
+    couples to ``ANTHROPIC_API_KEY``-only auth and broke OAuth users —
+    so the flag was removed (see :mod:`core.cli_backend` docstring).
+    The negative assertion at the end is a regression guard.
+    """
     backend, runner = make_backend([_ok(_ndjson(_assistant_event("ok")))])
     backend.complete("sys-prompt", [{"role": "user", "content": "hi"}])
     argv = runner.calls[0]["argv"]
     assert argv[0] == "claude"
     assert argv[1] == "--print"
     assert argv[2:4] == ["--model", "claude-sonnet-4-6"]
-    assert argv[4] == "--bare"
-    assert argv[5] == "--system-prompt-file"
-    # argv[6] is the temp file path — content checked below
-    assert argv[7] == "--input-format=stream-json"
-    assert argv[8] == "--output-format=stream-json"
-    assert argv[9] == "--verbose"
-    assert len(argv) == 10
+    assert argv[4] == "--system-prompt-file"
+    # argv[5] is the temp file path — content checked below
+    assert argv[6] == "--input-format=stream-json"
+    assert argv[7] == "--output-format=stream-json"
+    assert argv[8] == "--verbose"
+    assert len(argv) == 9
+    assert "--bare" not in argv
 
 
 def test_argv_model_flag_threads_through(make_backend) -> None:
@@ -230,7 +236,6 @@ def test_build_argv_helper_matches_spec() -> None:
         "--print",
         "--model",
         "claude-sonnet-4-6",
-        "--bare",
         "--system-prompt-file",
         "/tmp/sp.md",
         "--input-format=stream-json",
@@ -244,8 +249,8 @@ def test_system_prompt_file_contains_the_passed_text(make_backend, tmp_path) -> 
 
     def runner(argv, stdin_bytes):
         # capture path while file still exists, read content here
-        captured_path.append(argv[6])
-        with open(argv[6], "rb") as f:
+        captured_path.append(argv[5])
+        with open(argv[5], "rb") as f:
             captured_path.append(f.read().decode("utf-8"))  # type: ignore[arg-type]
         return _ok(_ndjson(_assistant_event("ok")))
 
@@ -262,7 +267,7 @@ def test_system_prompt_tempfile_is_cleaned_up_on_error() -> None:
     paths: list[str] = []
 
     def runner(argv, stdin_bytes):
-        paths.append(argv[6])
+        paths.append(argv[5])
         raise CliInvocationError("boom")
 
     backend = CliBackend(model="m", runner=runner)
@@ -290,6 +295,12 @@ def test_system_prompt_tempfile_helper_uses_lf_endings(tmp_path) -> None:
 
 
 def test_stdin_is_ndjson_one_object_per_line(make_backend) -> None:
+    """Each message is wrapped in the {"type":..., "message":{...}} envelope.
+
+    Claude Code's --input-format=stream-json silently ignores the bare
+    {"role":...,"content":...} shape (hooks fire, model is never called,
+    exit 0 with no assistant events). See :func:`_serialize_messages_ndjson`.
+    """
     backend, runner = make_backend([_ok(_ndjson(_assistant_event("ok")))])
     msgs = [
         {"role": "user", "content": "first"},
@@ -301,7 +312,7 @@ def test_stdin_is_ndjson_one_object_per_line(make_backend) -> None:
     lines = stdin_text.rstrip("\n").split("\n")
     assert len(lines) == 3
     parsed = [json.loads(line) for line in lines]
-    assert parsed == msgs
+    assert parsed == [{"type": m["role"], "message": m} for m in msgs]
 
 
 def test_stdin_terminates_with_a_single_newline(make_backend) -> None:
@@ -328,13 +339,17 @@ def test_stdin_preserves_unicode_without_ascii_escape(make_backend) -> None:
 
 
 def test_serialize_messages_ndjson_helper() -> None:
+    """Each emitted line is the wrapped envelope, not the bare message."""
     msgs = [
         {"role": "user", "content": "a"},
         {"role": "assistant", "content": "b"},
     ]
     out = _serialize_messages_ndjson(msgs)
     decoded = out.decode("utf-8").rstrip("\n").split("\n")
-    assert [json.loads(line) for line in decoded] == msgs
+    assert [json.loads(line) for line in decoded] == [
+        {"type": "user", "message": {"role": "user", "content": "a"}},
+        {"type": "assistant", "message": {"role": "assistant", "content": "b"}},
+    ]
 
 
 def test_serialize_messages_ndjson_empty_is_empty_bytes() -> None:
@@ -469,7 +484,10 @@ def test_human_literal_in_user_content_survives_round_trip(make_backend) -> None
     backend.complete("", [{"role": "user", "content": weird}])
     stdin_text = runner.calls[0]["stdin"].decode("utf-8")
     payload = json.loads(stdin_text.rstrip("\n"))
-    assert payload == {"role": "user", "content": weird}
+    assert payload == {
+        "type": "user",
+        "message": {"role": "user", "content": weird},
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -509,18 +527,27 @@ def test_three_iterations_send_full_history_on_turn_three(make_backend) -> None:
     lines = turn3_stdin.rstrip("\n").split("\n")
     parsed = [json.loads(line) for line in lines]
     assert len(parsed) == 5
-    assert [m["role"] for m in parsed] == [
+    # Each line is now the wrapped envelope; reach into ``message`` to
+    # inspect the underlying Messages-API record.
+    assert [m["type"] for m in parsed] == [
         "user",
         "assistant",
         "user",
         "assistant",
         "user",
     ]
-    assert parsed[0]["content"] == "make this better"
-    assert parsed[1]["content"] == "turn-1 reply"
-    assert parsed[2]["content"] == "shorter please"
-    assert parsed[3]["content"] == "turn-2 reply"
-    assert parsed[4]["content"] == "more concrete"
+    assert [m["message"]["role"] for m in parsed] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert parsed[0]["message"]["content"] == "make this better"
+    assert parsed[1]["message"]["content"] == "turn-1 reply"
+    assert parsed[2]["message"]["content"] == "shorter please"
+    assert parsed[3]["message"]["content"] == "turn-2 reply"
+    assert parsed[4]["message"]["content"] == "more concrete"
 
 
 def test_three_iterations_each_turn_produces_a_call(make_backend) -> None:
