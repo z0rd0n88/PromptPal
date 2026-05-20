@@ -8,12 +8,18 @@ The full command vector (per D-10) is::
 
     claude --print --model <m> --bare \\
            --system-prompt-file <path> \\
-           --input-format=stream-json --output-format=stream-json
+           --input-format=stream-json --output-format=stream-json \\
+           --verbose
 
 ``--bare`` strips Claude Code chrome from the output and
 ``--system-prompt-file`` lets the system prompt live as a real file (we
 write the ``system`` argument to a 0600 tempfile per call and clean up
-afterwards).
+afterwards). ``--verbose`` is mandated by the Claude CLI when ``--print``
+is combined with ``--output-format=stream-json``; the CLI exits 1 with
+``"--output-format=stream-json requires --verbose"`` otherwise. It does
+not add stderr chatter — the extra detail rides on the stream-json event
+channel, where :func:`_extract_text_from_event` already ignores
+non-``assistant`` event types by design.
 
 The ``messages`` array is fed to ``claude`` as NDJSON on **stdin**; the
 assistant response is reassembled from ``assistant`` events on
@@ -107,6 +113,7 @@ CLI_NOT_FOUND_MESSAGE: str = (
 STREAM_JSON_FLAGS: tuple[str, ...] = (
     "--input-format=stream-json",
     "--output-format=stream-json",
+    "--verbose",
 )
 
 
@@ -222,7 +229,7 @@ def _build_argv(
 
     The order matches the PRD literal so :func:`re`-style scrubbers can
     pin it: ``--print --model <m> --bare --system-prompt-file <p>
-    --input-format=stream-json --output-format=stream-json``.
+    --input-format=stream-json --output-format=stream-json --verbose``.
     """
     return [
         executable,

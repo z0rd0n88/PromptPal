@@ -143,10 +143,17 @@ def test_auth_failure_keywords_match_spec() -> None:
 
 
 def test_stream_json_flags_are_pinned() -> None:
-    """Catch silent reordering of the format flags."""
+    """Catch silent reordering of the format flags.
+
+    ``--verbose`` is mandatory in this combo: the Claude CLI exits 1 with
+    ``"--output-format=stream-json requires --verbose"`` when ``--print``
+    is used without it. Pinning the tuple here makes accidental removal
+    surface in CI instead of at first real invocation.
+    """
     assert STREAM_JSON_FLAGS == (
         "--input-format=stream-json",
         "--output-format=stream-json",
+        "--verbose",
     )
 
 
@@ -194,7 +201,8 @@ def test_argv_has_all_required_flags_in_d10_order(make_backend) -> None:
     # argv[6] is the temp file path — content checked below
     assert argv[7] == "--input-format=stream-json"
     assert argv[8] == "--output-format=stream-json"
-    assert len(argv) == 9
+    assert argv[9] == "--verbose"
+    assert len(argv) == 10
 
 
 def test_argv_model_flag_threads_through(make_backend) -> None:
@@ -227,6 +235,7 @@ def test_build_argv_helper_matches_spec() -> None:
         "/tmp/sp.md",
         "--input-format=stream-json",
         "--output-format=stream-json",
+        "--verbose",
     ]
 
 
