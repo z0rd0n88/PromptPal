@@ -256,14 +256,15 @@ def test_fresh_install_seeds_system_prompt_from_source(tmp_path: Path) -> None:
 
 
 def test_fresh_install_lays_down_lib_root(tmp_path: Path) -> None:
-    """``~/.promptpal/lib/`` must contain core/ and defaults/ so the
-    generated launcher can find ``core.main`` via PYTHONPATH."""
+    """``~/.promptpal/lib/`` must contain core/, defaults/, and the
+    path-invoked bootstrap so the generated launcher resolves ``core``."""
     result = _run_install(tmp_path)
     assert result.returncode == 0, result.stderr
     lib = tmp_path / "home" / ".promptpal" / "lib"
     assert (lib / "core" / "__init__.py").is_file()
     assert (lib / "core" / "main.py").is_file()
     assert (lib / "defaults" / "config.json").is_file()
+    assert (lib / "promptpal_main.py").is_file()
 
 
 def test_fresh_install_places_binary(tmp_path: Path) -> None:
@@ -478,7 +479,7 @@ def test_generated_launcher_wsl_guard_runs(tmp_path: Path) -> None:
 
 
 def test_generated_launcher_help_works(tmp_path: Path) -> None:
-    """End-to-end: installed launcher resolves core.main via PYTHONPATH."""
+    """End-to-end: installed launcher resolves core via the bootstrap path."""
     wrapper = _install_and_get_wrapper(tmp_path)
     safe_home = tmp_path / "runtime_home"
     safe_home.mkdir()

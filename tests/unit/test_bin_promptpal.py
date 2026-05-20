@@ -2,7 +2,7 @@
 
 Coverage map (1 test → 1 acceptance criterion or sub-rule):
 
-  AC #1  Delegates to ``python3 -m core.main``                       → test_help_*
+  AC #1  Invokes promptpal_main.py by path (not ``-m core.main``)     → test_help_*
   AC #1b core.main.main() delegates to core.cli.main()                → test_core_main_delegates_to_cli
   AC #1c Argv is forwarded verbatim (no munging in the wrapper)       → test_launcher_forwards_argv_verbatim
   AC #1d Python exit code propagates through ``exec``                 → test_launcher_propagates_python_exit_code
@@ -89,14 +89,26 @@ def test_launcher_uses_lf_line_endings() -> None:
     assert b"\r\n" not in raw, "launcher contains CRLF line endings"
 
 
-def test_launcher_delegates_to_core_main_text() -> None:
-    """The launcher must invoke ``python3 -m core.main`` literally (AC #1)."""
+def test_launcher_invokes_bootstrap_by_path() -> None:
+    """The launcher must invoke the bootstrap *by path*, not ``-m``.
+
+    ``python3 -m core.main`` puts the CWD on ``sys.path[0]`` and lets a
+    stray ``core/`` in the user's directory shadow the real package.
+    Invoking ``promptpal_main.py`` by path puts the script's own dir on
+    ``sys.path[0]`` instead. The negative assertion is the regression
+    guard against reverting to ``-m``.
+    """
     text = LAUNCHER.read_text(encoding="utf-8")
-    assert "python3 -m core.main" in text
+    # Inspect the actual exec line (ignore explanatory comments that may
+    # mention the old ``-m core.main`` invocation).
+    exec_lines = [ln for ln in text.splitlines() if ln.strip().startswith("exec ")]
+    assert len(exec_lines) == 1, exec_lines
+    assert "promptpal_main.py" in exec_lines[0]
+    assert "-m core.main" not in exec_lines[0]
 
 
 # ---------------------------------------------------------------------------
-# AC #1 — Delegates to python3 -m core.main
+# AC #1 — Invokes promptpal_main.py by path
 # ---------------------------------------------------------------------------
 
 
@@ -206,8 +218,9 @@ def test_launcher_forwards_argv_verbatim(tmp_path: Path) -> None:
     """Args passed to the launcher must reach ``python3`` unchanged.
 
     Stubs ``python3`` with a bash shim that records every argv element to
-    a file. The wrapper does ``exec python3 -m core.main "$@"``, so the
-    shim sees ``-m core.main`` followed by the user's argv.
+    a file. The wrapper does ``exec python3 <repo>/promptpal_main.py
+    "$@"``, so the shim sees the bootstrap path followed by the user's
+    argv.
     """
     bindir = tmp_path / "bin"
     bindir.mkdir()
@@ -231,8 +244,8 @@ def test_launcher_forwards_argv_verbatim(tmp_path: Path) -> None:
     assert result.returncode == 0, f"stderr={result.stderr!r}"
 
     forwarded = args_file.read_text(encoding="utf-8").splitlines()
-    assert forwarded[:2] == ["-m", "core.main"]
-    assert forwarded[2:] == ["--quiet", "improve this prompt", "--model", "x"]
+    assert forwarded[0].endswith("promptpal_main.py")
+    assert forwarded[1:] == ["--quiet", "improve this prompt", "--model", "x"]
 
 
 def test_launcher_propagates_python_exit_code(tmp_path: Path) -> None:
@@ -252,6 +265,45 @@ def test_launcher_propagates_python_exit_code(tmp_path: Path) -> None:
         extra_env={"PATH": str(bindir) + os.pathsep + os.environ.get("PATH", "")},
     )
     assert result.returncode == 42
+
+
+# ---------------------------------------------------------------------------
+# Regression — a stray ``core/`` in the CWD must NOT shadow the real package
+# ---------------------------------------------------------------------------
+
+
+def test_stray_core_in_cwd_does_not_shadow_real_package(tmp_path: Path) -> None:
+    """Running from a dir that has its own ``core/`` must still work.
+
+    This is the regression guard for the ``python3 -m core.main`` footgun:
+    ``-m`` put the CWD on ``sys.path[0]``, so a sabotage ``core/`` in the
+    working directory would be imported instead of the real one. The
+    path-invoked bootstrap puts the *script's* dir first, so the booby
+    trap is never imported and ``--help`` still exits 0.
+    """
+    booby = tmp_path / "booby"
+    (booby / "core").mkdir(parents=True)
+    # If this package is ever imported, it explodes loudly.
+    (booby / "core" / "__init__.py").write_text(
+        'raise RuntimeError("WRONG core/ imported from CWD")\n',
+        encoding="utf-8",
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    result = subprocess.run(
+        [str(LAUNCHER), "--help"],
+        cwd=str(booby),
+        env={"HOME": str(home), "PATH": os.environ.get("PATH", ""), "LANG": "C.UTF-8"},
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        f"launcher imported the stray core/ from CWD.\n--- stderr ---\n{result.stderr}"
+    )
+    assert "usage:" in result.stdout.lower()
+    assert "WRONG core/" not in result.stderr
 
 
 # ---------------------------------------------------------------------------

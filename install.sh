@@ -71,7 +71,8 @@ repo_root="$script_dir"
 for required in \
     "$repo_root/core" \
     "$repo_root/defaults/config.json" \
-    "$repo_root/core/system_prompt.txt"; do
+    "$repo_root/core/system_prompt.txt" \
+    "$repo_root/promptpal_main.py"; do
     if [ ! -e "$required" ]; then
         printf 'Error: required source path missing: %s\n' "$required" >&2
         printf 'Run install.sh from the PromptPal repository root.\n' >&2
@@ -89,6 +90,9 @@ mkdir -p "$PROMPTPAL_HOME/lib"
 rm -rf "$PROMPTPAL_HOME/lib/core" "$PROMPTPAL_HOME/lib/defaults"
 cp -R "$repo_root/core" "$PROMPTPAL_HOME/lib/core"
 cp -R "$repo_root/defaults" "$PROMPTPAL_HOME/lib/defaults"
+# Path-invoked bootstrap (sibling of core/ so ``import core`` resolves to
+# the managed lib, never a stray core/ in the user's cwd).
+cp "$repo_root/promptpal_main.py" "$PROMPTPAL_HOME/lib/promptpal_main.py"
 
 # Strip __pycache__/ that may have crept in from the dev checkout — keep
 # the install layout clean so the first run rebuilds bytecode for the
@@ -130,8 +134,7 @@ case "\${HOME:-}" in
 esac
 
 PROMPTPAL_LIB="$promptpal_lib"
-export PYTHONPATH="\${PROMPTPAL_LIB}\${PYTHONPATH:+:\${PYTHONPATH}}"
-exec python3 -m core.main "\$@"
+exec python3 "\${PROMPTPAL_LIB}/promptpal_main.py" "\$@"
 WRAPPER_EOF
 chmod +x "$wrapper"
 

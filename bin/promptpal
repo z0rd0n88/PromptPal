@@ -5,8 +5,16 @@
 #   1. Duplicate the WSL HOME guard from core/platform.py
 #      (P1-PLAT-03 / P1-ERR-12) so the fix message reaches the user
 #      BEFORE Python imports anything that might choke on an NTFS HOME.
-#   2. Exec ``python3 -m core.main`` so Python becomes the process
-#      and inherits signals cleanly (no orphaned wrapper).
+#   2. Exec ``python3 <repo_root>/promptpal_main.py`` so Python becomes
+#      the process and inherits signals cleanly (no orphaned wrapper).
+#
+# Why invoke the bootstrap by path instead of ``python3 -m core.main``?
+# ``-m`` puts the *current working directory* on ``sys.path[0]``, so
+# running promptpal from a directory that has its own ``core/`` package
+# (the source checkout, or any project with a ``core`` module) would
+# shadow the real package. Running a script by path puts the *script's*
+# directory on ``sys.path[0]`` instead — never the CWD. See
+# promptpal_main.py for the full rationale.
 #
 # Keep the WSL message text in sync with WSL_LAUNCH_FIX_MESSAGE in
 # core/platform.py. Tests pin the bash output against that constant so
@@ -24,15 +32,9 @@ case "${HOME:-}" in
         ;;
 esac
 
-# Resolve the repo root relative to this script so ``import core`` works
-# from any cwd in a dev checkout. For installed copies (US-013), the
-# ``core`` package will be on PYTHONPATH or site-packages already; in
-# that case this prepend is harmless because the resolved repo_root
-# won't contain a ``core/`` directory.
+# Resolve the repo root relative to this script so the bootstrap path is
+# absolute regardless of the caller's cwd.
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
-if [ -d "${repo_root}/core" ]; then
-    export PYTHONPATH="${repo_root}${PYTHONPATH:+:${PYTHONPATH}}"
-fi
 
-exec python3 -m core.main "$@"
+exec python3 "${repo_root}/promptpal_main.py" "$@"
