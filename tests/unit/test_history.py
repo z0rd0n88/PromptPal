@@ -30,6 +30,7 @@ from core._io import atomic_write_bytes
 from core.history import (
     HISTORY_WRITE_WARNING,
     INDEX_FILE_NAME,
+    AmbiguousSessionIdError,
     IndexEntry,
     ORIGINAL_PROMPT_PREVIEW_LIMIT,
     STATUS_ACCEPTED,
@@ -48,6 +49,7 @@ from core.history import (
     new_session,
     read_index,
     read_session,
+    resolve_session_id,
     search_history,
     session_path,
     upsert_index_entry,
@@ -386,6 +388,68 @@ def test_read_session_roundtrip(tmp_path):
 def test_read_session_missing_raises_session_not_found(tmp_path):
     with pytest.raises(SessionNotFoundError):
         read_session("nonexistent", tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# resolve_session_id — git-style full-id-or-unique-prefix lookup
+# ---------------------------------------------------------------------------
+
+
+def _seed_session(tmp_path, session_id: str) -> None:
+    write_session(_make_session(session_id=session_id), tmp_path)
+
+
+def test_resolve_exact_full_id_returns_it(tmp_path):
+    _seed_session(tmp_path, "b4449351af81440ca0f1e7085dadf89d")
+    assert (
+        resolve_session_id("b4449351af81440ca0f1e7085dadf89d", tmp_path)
+        == "b4449351af81440ca0f1e7085dadf89d"
+    )
+
+
+def test_resolve_unique_prefix_returns_full_id(tmp_path):
+    """The 8-char id shown by --show-history resolves to the full id."""
+    _seed_session(tmp_path, "b4449351af81440ca0f1e7085dadf89d")
+    _seed_session(tmp_path, "c7ff0fc895cc4bc3b5cf360a2edcafaf")
+    assert (
+        resolve_session_id("b4449351", tmp_path)
+        == "b4449351af81440ca0f1e7085dadf89d"
+    )
+
+
+def test_resolve_no_match_raises_not_found(tmp_path):
+    _seed_session(tmp_path, "b4449351af81440ca0f1e7085dadf89d")
+    with pytest.raises(SessionNotFoundError):
+        resolve_session_id("ffffffff", tmp_path)
+
+
+def test_resolve_ambiguous_prefix_raises(tmp_path):
+    _seed_session(tmp_path, "abcd1111111111111111111111111111")
+    _seed_session(tmp_path, "abcd2222222222222222222222222222")
+    with pytest.raises(AmbiguousSessionIdError) as exc:
+        resolve_session_id("abcd", tmp_path)
+    assert exc.value.prefix == "abcd"
+    assert len(exc.value.matches) == 2
+    assert exc.value.matches == [
+        "abcd1111111111111111111111111111",
+        "abcd2222222222222222222222222222",
+    ]
+
+
+def test_resolve_empty_string_is_not_found_not_match_all(tmp_path):
+    _seed_session(tmp_path, "b4449351af81440ca0f1e7085dadf89d")
+    with pytest.raises(SessionNotFoundError):
+        resolve_session_id("", tmp_path)
+
+
+def test_resolve_ignores_index_json(tmp_path):
+    """A prefix that would match index.json's stem must not resolve to it."""
+    _seed_session(tmp_path, "abc12345")
+    # index.json sits alongside session files; its stem is "index". The
+    # resolver must skip it (resolve only globs filenames, never parses it).
+    (tmp_path / INDEX_FILE_NAME).write_text("[]", encoding="utf-8")
+    with pytest.raises(SessionNotFoundError):
+        resolve_session_id("index", tmp_path)
 
 
 def test_session_path_helper_uses_uuid_naming(tmp_path):

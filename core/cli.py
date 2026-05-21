@@ -57,6 +57,7 @@ from core.diff import format_diff, should_show_diff
 from core.history import (
     HISTORY_WRITE_WARNING,
     STATUS_ACCEPTED,
+    AmbiguousSessionIdError,
     IndexEntry,
     Session,
     SessionNotFoundError,
@@ -69,6 +70,7 @@ from core.history import (
     new_session,
     read_index,
     read_session,
+    resolve_session_id,
     search_history,
     upsert_index_entry,
     write_session,
@@ -145,6 +147,13 @@ REPLAY_EMPTY_TEMPLATE: str = (
 """Stderr line when ``--replay`` targets a session that never got an assistant reply."""
 
 EXPORT_NOT_FOUND_TEMPLATE: str = "Error: session {session_id!r} not found."
+AMBIGUOUS_SESSION_ID_TEMPLATE: str = (
+    "Error: session id {prefix!r} is ambiguous ({count} matches: {sample}). "
+    "Use more characters."
+)
+"""Stderr line when a session-id prefix matches more than one session
+(shared by ``--export`` and ``--replay``)."""
+
 UPDATE_SUCCESS_TEMPLATE: str = "System prompt updated at {path}."
 UPDATE_BACKUP_TEMPLATE: str = "Previous prompt backed up at {path}."
 
@@ -512,6 +521,16 @@ def cmd_search(
 # ---------------------------------------------------------------------------
 
 
+def _ambiguous_id_message(e: AmbiguousSessionIdError, *, sample_n: int = 3) -> str:
+    """Format the shared ambiguous-prefix error from the exception."""
+    sample = ", ".join(e.matches[:sample_n])
+    if len(e.matches) > sample_n:
+        sample += ", ..."
+    return AMBIGUOUS_SESSION_ID_TEMPLATE.format(
+        prefix=e.prefix, count=len(e.matches), sample=sample
+    )
+
+
 def cmd_export(
     *,
     session_id: str,
@@ -521,12 +540,18 @@ def cmd_export(
 ) -> int:
     """Dump the full session JSON for ``session_id`` to stdout, exit 0/1.
 
-    Returns 1 with an error on ``stderr`` when the session is missing or
-    unreadable; the body of the JSON file is the source of truth so we
-    re-serialize through :func:`Session.to_dict` for canonical formatting.
+    ``session_id`` may be a full id or a unique prefix (the 8-char id from
+    ``--show-history`` resolves here). Returns 1 with an error on
+    ``stderr`` when the session is missing, ambiguous, or unreadable; the
+    body of the JSON file is the source of truth so we re-serialize
+    through :func:`Session.to_dict` for canonical formatting.
     """
     try:
-        session = read_session(session_id, history_dir)
+        full_id = resolve_session_id(session_id, history_dir)
+        session = read_session(full_id, history_dir)
+    except AmbiguousSessionIdError as e:
+        print(_ambiguous_id_message(e), file=stderr)
+        return EXIT_FAILURE
     except SessionNotFoundError:
         print(
             EXPORT_NOT_FOUND_TEMPLATE.format(session_id=session_id),
@@ -612,7 +637,11 @@ def cmd_replay(
       display first).
     """
     try:
-        source = read_session(session_id, history_dir)
+        full_id = resolve_session_id(session_id, history_dir)
+        source = read_session(full_id, history_dir)
+    except AmbiguousSessionIdError as e:
+        print(_ambiguous_id_message(e), file=stderr)
+        return EXIT_FAILURE
     except SessionNotFoundError:
         print(
             REPLAY_NOT_FOUND_TEMPLATE.format(session_id=session_id),

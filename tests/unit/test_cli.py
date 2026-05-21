@@ -586,6 +586,61 @@ class TestCmdExport:
         assert parsed["final_prompt"] == "improved"
         assert parsed["status"] == "accepted"
 
+    def test_unique_prefix_resolves(self, tmp_path: Path) -> None:
+        """The 8-char id from --show-history is usable with --export."""
+        full = "b4449351af81440ca0f1e7085dadf89d"
+        write_session(_make_session_for_export(full), tmp_path)
+        write_session(_make_session_for_export("c7ff0fc895cc4bc3b"), tmp_path)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        rc = cmd_export(
+            session_id="b4449351",
+            history_dir=tmp_path,
+            stdout=stdout,
+            stderr=stderr,
+        )
+        assert rc == EXIT_OK, stderr.getvalue()
+        assert json.loads(stdout.getvalue())["session_id"] == full
+
+    def test_ambiguous_prefix_exits_1(self, tmp_path: Path) -> None:
+        write_session(_make_session_for_export("abcd1111111111111111"), tmp_path)
+        write_session(_make_session_for_export("abcd2222222222222222"), tmp_path)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        rc = cmd_export(
+            session_id="abcd",
+            history_dir=tmp_path,
+            stdout=stdout,
+            stderr=stderr,
+        )
+        assert rc == EXIT_FAILURE
+        assert "ambiguous" in stderr.getvalue().lower()
+        assert stdout.getvalue() == ""
+
+
+def _make_session_for_export(session_id: str) -> Session:
+    return Session(
+        session_id=session_id,
+        created_at="2026-05-01T00:00:00Z",
+        updated_at="2026-05-01T00:00:01Z",
+        status="accepted",
+        label=None,
+        original_prompt="orig",
+        model="claude-sonnet-4-6",
+        backend="api-key (test)",
+        turns=(
+            Turn(
+                role="user",
+                content="orig",
+                backend="api-key (test)",
+                input_tokens=None,
+                output_tokens=None,
+                timestamp="2026-05-01T00:00:00Z",
+            ),
+        ),
+        final_prompt="improved",
+    )
+
 
 # ===========================================================================
 # AC #6 — cmd_status

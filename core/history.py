@@ -112,6 +112,21 @@ class SessionNotFoundError(HistoryError):
     """Raised when :func:`read_session` cannot locate the requested session."""
 
 
+class AmbiguousSessionIdError(HistoryError):
+    """Raised when a session-id prefix matches more than one session.
+
+    Carries the offending ``prefix`` and the sorted list of full
+    ``matches`` so the CLI can tell the user how to disambiguate.
+    """
+
+    def __init__(self, prefix: str, matches: list[str]) -> None:
+        self.prefix = prefix
+        self.matches = matches
+        super().__init__(
+            f"Session id {prefix!r} is ambiguous ({len(matches)} matches)"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Data classes (frozen — immutable session shape, AC for safe replay)
 # ---------------------------------------------------------------------------
@@ -404,6 +419,42 @@ def read_session(session_id: str, history_dir: str | Path) -> Session:
         raise SessionNotFoundError(f"Session {session_id} not found at {target}")
     data = json.loads(target.read_text(encoding="utf-8"))
     return Session.from_dict(data)
+
+
+def resolve_session_id(id_or_prefix: str, history_dir: str | Path) -> str:
+    """Resolve a full session id *or a unique prefix* to a full session id.
+
+    Git-style lookup so the 8-char id printed by ``--show-history`` /
+    ``--search`` is directly usable with ``--export`` / ``--replay``
+    (the displayed id is a prefix of the 32-char on-disk id):
+
+    - An exact ``<id>.json`` match wins immediately (fast path).
+    - Otherwise, if exactly one stored session id *starts with*
+      ``id_or_prefix``, its full id is returned.
+    - No match → :class:`SessionNotFoundError`.
+    - More than one match → :class:`AmbiguousSessionIdError`.
+
+    Empty ``id_or_prefix`` is treated as "no match" rather than matching
+    every session.
+    """
+    history_dir = Path(history_dir)
+    if id_or_prefix:
+        candidate = session_path(history_dir, id_or_prefix)
+        # Guard against id_or_prefix == "index" resolving to index.json.
+        if candidate.exists() and candidate.name != INDEX_FILE_NAME:
+            return id_or_prefix
+    else:
+        raise SessionNotFoundError(f"Session {id_or_prefix!r} not found")
+    matches = sorted(
+        p.stem
+        for p in history_dir.glob(f"*{SESSION_FILE_SUFFIX}")
+        if p.name != INDEX_FILE_NAME and p.stem.startswith(id_or_prefix)
+    )
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise SessionNotFoundError(f"Session {id_or_prefix!r} not found")
+    raise AmbiguousSessionIdError(prefix=id_or_prefix, matches=matches)
 
 
 # ---------------------------------------------------------------------------
