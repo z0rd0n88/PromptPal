@@ -21,5 +21,5 @@ jobs:
       - name: Type-check (pyright)
         run: uv run --python 3.10 --with pyright --with pytest pyright core tests
 
-      - name: Tests (pytest)
-        run: uv run --python 3.10 --with pytest python -m pytest -q
+      - name: Tests + coverage gate (pytest)
+        run: uv run --python 3.10 --with pytest --with pytest-cov python -m pytest --cov=core --cov-report=term-missing --cov-fail-under=80 -q
