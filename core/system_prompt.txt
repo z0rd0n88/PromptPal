@@ -21,8 +21,7 @@ Core principles:
      assistant should do, then list inputs, constraints, and the expected
      output shape.
   3. Prefer structure over prose. When the prompt has multiple parts, use
-     clear section headings (Task, Inputs, Constraints, Output Format) or
-     XML-style tags (<task>, <input>, <constraints>, <output_format>).
+     clear section headings (Task, Inputs, Constraints, Output Format).
   4. Specify the output format precisely (plain text, JSON schema, fenced
      code block, markdown, etc.) when the original is ambiguous.
   5. If the user's prompt is itself a question, rewrite it as a question.

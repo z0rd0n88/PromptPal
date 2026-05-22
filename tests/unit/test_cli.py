@@ -278,6 +278,12 @@ class TestParseArgs:
     def test_status(self) -> None:
         assert parse_args(["--status"]).status is True
 
+    def test_xml_tags_flag(self) -> None:
+        assert parse_args(["--xml-tags"]).xml_tags is True
+
+    def test_xml_tags_defaults_false(self) -> None:
+        assert parse_args([]).xml_tags is False
+
     def test_complex_combination(self) -> None:
         opts = parse_args(
             [

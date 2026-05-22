@@ -97,6 +97,7 @@ from core.system_prompt import (
     SystemPromptDownloadError,
     SystemPromptError,
     SystemPromptMissingError,
+    apply_xml_tags_directive,
     read_system_prompt,
     resolve_system_prompt_path,
     seed_system_prompt,
@@ -195,6 +196,7 @@ class CLIOptions:
     uninstall: bool = False
     backend: str | None = None
     status: bool = False
+    xml_tags: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +314,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print backend, model, auth, platform, config path, history count, then exit.",
     )
+    parser.add_argument(
+        "--xml-tags",
+        action="store_true",
+        help=(
+            "Let the model use XML-style tags (<task>, <input>, ...) to "
+            "structure the rewrite. Default: plain section headings only."
+        ),
+    )
 
     return parser
 
@@ -337,6 +347,7 @@ def parse_args(argv: Sequence[str] | None = None) -> CLIOptions:
         uninstall=ns.uninstall,
         backend=ns.backend,
         status=ns.status,
+        xml_tags=ns.xml_tags,
     )
 
 
@@ -668,6 +679,7 @@ def cmd_replay(
     except SystemPromptMissingError as e:
         print(str(e), file=stderr)
         return EXIT_FAILURE
+    system = apply_xml_tags_directive(system, enabled=options.xml_tags)
 
     backend_short = _short_backend_name(backend)
 
@@ -988,6 +1000,7 @@ def _run_pipeline(
     except SystemPromptMissingError as e:
         print(str(e), file=stderr)
         return EXIT_FAILURE
+    system = apply_xml_tags_directive(system, enabled=options.xml_tags)
 
     initial_messages: list[dict[str, str]] = [
         {"role": "user", "content": original_prompt}

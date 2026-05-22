@@ -28,12 +28,14 @@ from core.system_prompt import (
     DOWNLOAD_FAILED_MESSAGE_TEMPLATE,
     MISSING_MESSAGE_TEMPLATE,
     SHA256_SIDECAR_SUFFIX,
+    XML_TAGS_DIRECTIVE,
     SystemPromptChecksumError,
     SystemPromptDownloadError,
     SystemPromptError,
     SystemPromptMissingError,
     _atomic_write_bytes,
     _parse_sidecar,
+    apply_xml_tags_directive,
     read_system_prompt,
     resolve_system_prompt_path,
     seed_system_prompt,
@@ -95,6 +97,41 @@ def test_bundled_system_prompt_uses_lf_line_endings():
     """The bundled prompt is UTF-8 / LF (P1-PLAT-08)."""
     raw = BUNDLED_SYSTEM_PROMPT_PATH.read_bytes()
     assert b"\r\n" not in raw, "bundled prompt must not contain CRLF"
+
+
+def test_bundled_system_prompt_omits_xml_tags_by_default():
+    """The default prompt prefers plain headings — XML-style tags are opt-in.
+
+    The XML-style-tags option lives in :data:`XML_TAGS_DIRECTIVE` and is only
+    appended when ``--xml-tags`` is passed; the bundled file must not carry it.
+    """
+    body = BUNDLED_SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
+    assert "XML-style" not in body
+    assert "<task>" not in body
+
+
+# ---------------------------------------------------------------------------
+# --xml-tags directive (opt-in XML-style structure tags)
+# ---------------------------------------------------------------------------
+
+
+class TestApplyXmlTagsDirective:
+    def test_disabled_returns_system_unchanged(self):
+        """Default (flag off): the system prompt is returned verbatim."""
+        system = "You are PromptPal.\n"
+        assert apply_xml_tags_directive(system, enabled=False) == system
+
+    def test_enabled_appends_directive_and_preserves_original(self):
+        """Flag on: the directive is appended and the original text survives."""
+        system = "You are PromptPal."
+        out = apply_xml_tags_directive(system, enabled=True)
+        assert out.startswith(system)
+        assert XML_TAGS_DIRECTIVE in out
+
+    def test_directive_names_the_xml_tags(self):
+        """The directive actually instructs the model about the XML-style tags."""
+        assert "<task>" in XML_TAGS_DIRECTIVE
+        assert "XML-style" in XML_TAGS_DIRECTIVE
 
 
 # ---------------------------------------------------------------------------
