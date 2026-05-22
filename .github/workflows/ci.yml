@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  pull_request:
+    branches: ["main"]
+  push:
+    branches: ["main"]
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Pin Python 3.10
+        run: uv python install 3.10
+
+      - name: Type-check (pyright)
+        run: uv run --python 3.10 --with pyright --with pytest pyright core tests
+
+      - name: Tests (pytest)
+        run: uv run --python 3.10 --with pytest python -m pytest -q
