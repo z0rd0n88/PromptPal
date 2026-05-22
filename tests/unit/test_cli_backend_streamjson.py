@@ -47,6 +47,7 @@ from core.cli_backend import (
     _parse_stream_json,
     _safe_unlink,
     _serialize_messages_ndjson,
+    _summarize_stdout_failure,
     _write_system_prompt_tempfile,
 )
 
@@ -65,6 +66,26 @@ def _assistant_event(text: str) -> dict[str, Any]:
             "content": [{"type": "text", "text": text}],
         },
     }
+
+
+def _api_retry_event(
+    attempt: int, *, status: int = 529, error: str = "rate_limit", max_retries: int = 10
+) -> dict[str, Any]:
+    """A ``system/api_retry`` envelope as emitted on stdout while the CLI
+    retries an overloaded/rate-limited API (observed against claude 2.1.143)."""
+    return {
+        "type": "system",
+        "subtype": "api_retry",
+        "attempt": attempt,
+        "max_retries": max_retries,
+        "error_status": status,
+        "error": error,
+    }
+
+
+def _result_error_event(error: str) -> dict[str, Any]:
+    """A terminal ``result`` envelope flagged as an error."""
+    return {"type": "result", "subtype": "error_during_execution", "is_error": True, "error": error}
 
 
 def _ndjson(*events: dict[str, Any]) -> bytes:
@@ -402,6 +423,79 @@ def test_invocation_error_excludes_no_stderr_placeholder(make_backend) -> None:
     with pytest.raises(CliInvocationError) as exc:
         backend.complete("", [{"role": "user", "content": "hi"}])
     assert "<no stderr>" in str(exc.value)
+
+
+def test_invocation_error_surfaces_stdout_retry_diagnostic(make_backend) -> None:
+    """The real-world bug: claude exhausts API retries (HTTP 529) and exits
+    non-zero with **empty stderr** — the reason rides on stdout as
+    ``api_retry`` events. The error must surface that, not ``<no stderr>``.
+    """
+    stdout = _ndjson(
+        {"type": "system", "subtype": "init"},
+        _api_retry_event(1),
+        _api_retry_event(10),
+    )
+    backend, _ = make_backend([_CliRunResult(exit_code=1, stdout=stdout, stderr=b"")])
+    with pytest.raises(CliInvocationError) as exc:
+        backend.complete("", [{"role": "user", "content": "hi"}])
+    msg = str(exc.value)
+    assert "claude exited 1" in msg
+    assert "529" in msg
+    assert "rate_limit" in msg
+    assert "<no stderr>" not in msg
+
+
+def test_invocation_error_surfaces_stdout_result_error(make_backend) -> None:
+    """A terminal ``result`` event flagged ``is_error`` is the authoritative
+    reason and is preferred over retry chatter."""
+    stdout = _ndjson(
+        _api_retry_event(1),
+        _result_error_event("context length exceeded"),
+    )
+    backend, _ = make_backend([_CliRunResult(exit_code=1, stdout=stdout, stderr=b"")])
+    with pytest.raises(CliInvocationError) as exc:
+        backend.complete("", [{"role": "user", "content": "hi"}])
+    assert "context length exceeded" in str(exc.value)
+
+
+def test_invocation_error_prefers_stderr_over_stdout_when_present(make_backend) -> None:
+    """Existing behaviour is preserved: a non-empty stderr still wins, so the
+    stdout scan is a pure fallback that can't regress today's messages."""
+    stdout = _ndjson(_api_retry_event(10))
+    backend, _ = make_backend(
+        [_CliRunResult(exit_code=2, stdout=stdout, stderr=b"explicit stderr reason")]
+    )
+    with pytest.raises(CliInvocationError) as exc:
+        backend.complete("", [{"role": "user", "content": "hi"}])
+    assert "explicit stderr reason" in str(exc.value)
+
+
+def test_summarize_stdout_failure_summarizes_retry_storm() -> None:
+    stdout = _ndjson(_api_retry_event(1), _api_retry_event(2), _api_retry_event(10))
+    summary = _summarize_stdout_failure(stdout)
+    assert "rate_limit" in summary
+    assert "529" in summary
+    assert "10" in summary  # max_retries / attempts surfaced
+
+
+def test_summarize_stdout_failure_prefers_result_error_event() -> None:
+    stdout = _ndjson(_api_retry_event(1), _result_error_event("the real reason"))
+    assert _summarize_stdout_failure(stdout) == "the real reason"
+
+
+def test_summarize_stdout_failure_ignores_successful_result() -> None:
+    """A clean run carries a non-error ``result`` — it must not be mistaken
+    for a failure reason."""
+    stdout = _ndjson(
+        _assistant_event("hi"),
+        {"type": "result", "subtype": "success", "is_error": False},
+    )
+    assert _summarize_stdout_failure(stdout) == ""
+
+
+def test_summarize_stdout_failure_empty_and_garbage_return_empty() -> None:
+    assert _summarize_stdout_failure(b"") == ""
+    assert _summarize_stdout_failure(b"not json\n{broken\n") == ""
 
 
 def test_is_auth_failure_helper() -> None:

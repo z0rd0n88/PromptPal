@@ -69,6 +69,18 @@ case-insensitive substrings in :data:`AUTH_FAILURE_KEYWORDS` ::
 ``"Claude CLI auth failed. Run: claude auth login"`` message. Other
 non-zero exits raise :class:`CliInvocationError`.
 
+Stdout diagnostic fallback
+--------------------------
+
+Under ``--output-format=stream-json`` the CLI reports *non-auth*
+failures on **stdout** (as ``result``/``api_retry`` events), leaving
+stderr empty — most commonly when an overloaded API (HTTP 529) makes
+``claude`` exhaust its 10 internal retries and exit 1. When stderr is
+empty, :func:`_summarize_stdout_failure` mines that stdout stream so
+:class:`CliInvocationError` carries the real reason (e.g.
+``"rate_limit (HTTP 529) after 10 retries (claude gave up)"``) instead
+of a bare ``"<no stderr>"``.
+
 Token accounting (P1-BKND-10)
 -----------------------------
 
@@ -328,6 +340,77 @@ def _parse_stream_json(stdout: bytes) -> str:
     return "".join(chunks)
 
 
+def _format_retry_summary(retry: dict[str, Any], count: int) -> str:
+    """Render one ``api_retry`` event as a human-readable failure reason.
+
+    The Claude CLI retries an overloaded/rate-limited API (HTTP 529/429)
+    with exponential backoff up to ``max_retries`` before exiting
+    non-zero; the last such event tells us *why* it gave up.
+    """
+    error = retry.get("error")
+    status = retry.get("error_status")
+    if isinstance(error, str) and error and isinstance(status, int):
+        reason = f"{error} (HTTP {status})"
+    elif isinstance(error, str) and error:
+        reason = error
+    elif isinstance(status, int):
+        reason = f"HTTP {status}"
+    else:
+        reason = "API error"
+    maximum = retry.get("max_retries")
+    attempts = maximum if isinstance(maximum, int) else count
+    return f"{reason} after {attempts} retries (claude gave up)"
+
+
+def _summarize_stdout_failure(stdout: bytes) -> str:
+    """Best-effort one-line failure reason from a stream-json stdout stream.
+
+    On a non-zero exit the Claude CLI reports *why* on **stdout** (as
+    stream-json ``system``/``result`` events), not on stderr — so without
+    this the user only ever sees ``claude exited 1: <no stderr>`` and has
+    no idea a transient, retryable overload (HTTP 529) is to blame. We
+    scan, in priority order, for:
+
+    1. a terminal ``result`` event flagged ``is_error`` (the CLI's own
+       authoritative final status), then
+    2. ``api_retry`` events (the CLI exhausting its retries against an
+       overloaded/rate-limited API), summarising the last one.
+
+    Returns ``""`` when stdout carries no recognisable failure signal, so
+    the caller falls back to its own placeholder. Mirrors
+    :func:`_parse_stream_json`'s contract: unparseable lines are skipped
+    and a novel event shape never raises — a parsing slip must not mask
+    the original exit code.
+    """
+    result_reason = ""
+    last_retry: dict[str, Any] | None = None
+    retry_count = 0
+    for raw_line in stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "result" and event.get("is_error"):
+            for key in ("error", "result", "subtype"):
+                value = event.get(key)
+                if isinstance(value, str) and value.strip():
+                    result_reason = value.strip()
+                    break
+        elif event.get("subtype") == "api_retry":
+            retry_count += 1
+            last_retry = event
+    if result_reason:
+        return result_reason[:500]
+    if last_retry is not None:
+        return _format_retry_summary(last_retry, retry_count)[:500]
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # CliBackend
 # ---------------------------------------------------------------------------
@@ -388,9 +471,15 @@ class CliBackend(Backend):
             stderr_text = result.stderr.decode("utf-8", errors="replace")
             if _is_auth_failure(stderr_text):
                 raise CliAuthError(AUTH_ERROR_MESSAGE)
+            # In stream-json mode claude reports failures on stdout (e.g. an
+            # api_retry storm after an HTTP 529 overload), leaving stderr
+            # empty. Fall back to the stdout diagnostic so the user sees the
+            # real reason instead of a bare ``<no stderr>``.
+            detail = stderr_text.strip()[:500]
+            if not detail:
+                detail = _summarize_stdout_failure(result.stdout)
             raise CliInvocationError(
-                f"claude exited {result.exit_code}: "
-                f"{stderr_text.strip()[:500] or '<no stderr>'}"
+                f"claude exited {result.exit_code}: {detail or '<no stderr>'}"
             )
         text = _parse_stream_json(result.stdout)
         return BackendResponse(text=text, input_tokens=None, output_tokens=None)
