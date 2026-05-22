@@ -571,3 +571,37 @@ class TestStatusFlag:
         lines = stdout.splitlines()
         assert lines[0].startswith("Platform: ")
         assert len(lines) < 20
+
+
+class _CapturingBackend(FakeBackend):
+    """FakeBackend that records the ``system`` text of every completion."""
+
+    def __init__(self, responses: list[BackendResponse]) -> None:
+        super().__init__(responses)
+        self.systems: list[str] = []
+
+    def complete(
+        self, system: str, messages: list[dict], stream: bool = False
+    ) -> BackendResponse:
+        self.systems.append(system)
+        return super().complete(system, messages, stream)
+
+
+class TestXmlTagsFlag:
+    def test_default_omits_xml_tags_directive(self, env: dict[str, Path]) -> None:
+        backend = _CapturingBackend(
+            [BackendResponse(text="improved", input_tokens=None, output_tokens=None)]
+        )
+        _run(["--quiet", "p"], env=env, backend=backend)
+        # Default: the system prompt the backend sees carries no tag option.
+        assert "<task>" not in backend.systems[0]
+
+    def test_xml_tags_appends_directive(self, env: dict[str, Path]) -> None:
+        backend = _CapturingBackend(
+            [BackendResponse(text="improved", input_tokens=None, output_tokens=None)]
+        )
+        _run(["--quiet", "--xml-tags", "p"], env=env, backend=backend)
+        # --xml-tags injects the opt-in directive into the system prompt.
+        assert "<task>" in backend.systems[0]
+        # The on-disk base prompt still rides along ahead of the directive.
+        assert backend.systems[0].startswith("You are PromptPal.")

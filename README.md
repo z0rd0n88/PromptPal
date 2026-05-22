@@ -154,6 +154,8 @@ options:
   --uninstall             Run uninstall.sh.
   --backend {auto,claude-cli,api-key}
   --status                Print backend, model, auth, platform, history count.
+  --xml-tags              Let the model structure the rewrite with XML-style
+                          tags (<task>, <input>, ...). Default: plain headings.
 ```
 
 ## Architecture

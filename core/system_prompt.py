@@ -103,6 +103,17 @@ DOWNLOAD_FAILED_MESSAGE_TEMPLATE: str = (
 )
 """Canonical P1-ERR-15 template — used for both main and sidecar fetch failures."""
 
+XML_TAGS_DIRECTIVE: str = (
+    "Output-structure option: when the prompt has multiple parts, you may "
+    "delimit the sections of the rewritten prompt with XML-style tags "
+    "(<task>, <input>, <constraints>, <output_format>) instead of plain "
+    "section headings."
+)
+"""Opt-in instruction appended to the system prompt only when ``--xml-tags``
+is passed. The bundled default prompt deliberately omits the XML-style-tags
+option (it prefers plain headings); this directive restores it per-invocation
+via :func:`apply_xml_tags_directive`."""
+
 
 # ---------------------------------------------------------------------------
 # Error hierarchy
@@ -247,6 +258,25 @@ def read_system_prompt(path: str | Path) -> str:
         raise SystemPromptMissingError(
             MISSING_MESSAGE_TEMPLATE.format(path=path_obj)
         ) from e
+
+
+# ---------------------------------------------------------------------------
+# XML-style-tags directive (--xml-tags opt-in)
+# ---------------------------------------------------------------------------
+
+
+def apply_xml_tags_directive(system: str, *, enabled: bool) -> str:
+    """Return ``system`` with the XML-style-tags directive appended when enabled.
+
+    The bundled prompt tells the model to structure multi-part rewrites with
+    plain section headings only. ``--xml-tags`` opts back into the XML-style
+    tag option for a single invocation by appending
+    :data:`XML_TAGS_DIRECTIVE`. When ``enabled`` is ``False`` the prompt is
+    returned verbatim, so the default path is byte-for-byte the on-disk file.
+    """
+    if not enabled:
+        return system
+    return f"{system.rstrip()}\n\n{XML_TAGS_DIRECTIVE}\n"
 
 
 # ---------------------------------------------------------------------------
