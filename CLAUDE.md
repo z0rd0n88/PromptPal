@@ -18,6 +18,9 @@
   The README's bare `python -m pytest` does not work as-is.
 - `tests/unit` is fast (fake runners, no subprocess); `tests/integration` also uses fakes.
   `tests/integration/test_winget_launcher.py` skips off-Windows.
+- Type-check with `uv run --with pyright --with pytest pyright core tests` — pyright needs
+  `--with pytest` too, or it false-flags `Import "pytest" could not be resolved`.
+- `/checks` runs both (pyright + full pytest); CI (`.github/workflows/ci.yml`) runs them on every PR.
 
 ## Reinstall after code changes
 - The `promptpal` command runs from a **copied** snapshot at `${PROMPTPAL_HOME:-~/.promptpal}/lib`,
