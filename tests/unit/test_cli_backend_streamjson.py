@@ -320,7 +320,10 @@ def test_stdin_is_ndjson_one_object_per_line(make_backend) -> None:
 
     Claude Code's --input-format=stream-json silently ignores the bare
     {"role":...,"content":...} shape (hooks fire, model is never called,
-    exit 0 with no assistant events). See :func:`_serialize_messages_ndjson`.
+    exit 0 with no assistant events). It also requires ``content`` to be a
+    block array, not a bare string — see
+    :func:`test_serialize_multiturn_content_is_block_shaped`.
+    See :func:`_serialize_messages_ndjson`.
     """
     backend, runner = make_backend([_ok(_ndjson(_assistant_event("ok")))])
     msgs = [
@@ -333,7 +336,16 @@ def test_stdin_is_ndjson_one_object_per_line(make_backend) -> None:
     lines = stdin_text.rstrip("\n").split("\n")
     assert len(lines) == 3
     parsed = [json.loads(line) for line in lines]
-    assert parsed == [{"type": m["role"], "message": m} for m in msgs]
+    assert parsed == [
+        {
+            "type": m["role"],
+            "message": {
+                "role": m["role"],
+                "content": [{"type": "text", "text": m["content"]}],
+            },
+        }
+        for m in msgs
+    ]
 
 
 def test_stdin_terminates_with_a_single_newline(make_backend) -> None:
@@ -360,7 +372,12 @@ def test_stdin_preserves_unicode_without_ascii_escape(make_backend) -> None:
 
 
 def test_serialize_messages_ndjson_helper() -> None:
-    """Each emitted line is the wrapped envelope, not the bare message."""
+    """Each line is the wrapped envelope with block-shaped content.
+
+    String ``content`` is normalized to ``[{"type":"text","text":...}]``
+    rather than emitted as a bare string — see
+    :func:`test_serialize_multiturn_content_is_block_shaped`.
+    """
     msgs = [
         {"role": "user", "content": "a"},
         {"role": "assistant", "content": "b"},
@@ -368,9 +385,50 @@ def test_serialize_messages_ndjson_helper() -> None:
     out = _serialize_messages_ndjson(msgs)
     decoded = out.decode("utf-8").rstrip("\n").split("\n")
     assert [json.loads(line) for line in decoded] == [
-        {"type": "user", "message": {"role": "user", "content": "a"}},
-        {"type": "assistant", "message": {"role": "assistant", "content": "b"}},
+        {
+            "type": "user",
+            "message": {"role": "user", "content": [{"type": "text", "text": "a"}]},
+        },
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "b"}],
+            },
+        },
     ]
+
+
+def test_serialize_multiturn_content_is_block_shaped() -> None:
+    """Regression: assistant turns must carry a block array, not a string.
+
+    The Claude CLI's ``--input-format=stream-json`` parser scans every
+    message's content blocks for tool markers (``"tool_use_id" in block``).
+    A bare-string ``content`` makes JavaScriptCore iterate the string
+    character-by-character and throw ``W is not an Object. (evaluating
+    '"tool_use_id"in W')`` — which surfaced as ``claude exited 1`` on the
+    first ``[i]terate`` turn (the single-turn first call slipped through
+    because a lone trailing user prompt isn't block-scanned).
+    """
+    msgs = [
+        {"role": "user", "content": "Improve: write a poem"},
+        {"role": "assistant", "content": "Write a vivid 8-line poem about dawn."},
+        {"role": "user", "content": "Improve this further."},
+    ]
+    out = _serialize_messages_ndjson(msgs)
+    for line in out.decode("utf-8").rstrip("\n").split("\n"):
+        content = json.loads(line)["message"]["content"]
+        assert isinstance(content, list)
+        assert all(isinstance(block, dict) for block in content)
+
+
+def test_serialize_already_block_content_passes_through() -> None:
+    """List ``content`` is forwarded unchanged (idempotent normalization)."""
+    blocks = [{"type": "text", "text": "x"}]
+    msgs = [{"role": "user", "content": blocks}]
+    out = _serialize_messages_ndjson(msgs)
+    line = json.loads(out.decode("utf-8").rstrip("\n"))
+    assert line == {"type": "user", "message": {"role": "user", "content": blocks}}
 
 
 def test_serialize_messages_ndjson_empty_is_empty_bytes() -> None:
@@ -580,7 +638,7 @@ def test_human_literal_in_user_content_survives_round_trip(make_backend) -> None
     payload = json.loads(stdin_text.rstrip("\n"))
     assert payload == {
         "type": "user",
-        "message": {"role": "user", "content": weird},
+        "message": {"role": "user", "content": [{"type": "text", "text": weird}]},
     }
 
 
@@ -637,11 +695,17 @@ def test_three_iterations_send_full_history_on_turn_three(make_backend) -> None:
         "assistant",
         "user",
     ]
-    assert parsed[0]["message"]["content"] == "make this better"
-    assert parsed[1]["message"]["content"] == "turn-1 reply"
-    assert parsed[2]["message"]["content"] == "shorter please"
-    assert parsed[3]["message"]["content"] == "turn-2 reply"
-    assert parsed[4]["message"]["content"] == "more concrete"
+    # Content is normalized to the CLI's block-array shape so the
+    # multi-turn history doesn't crash the stream-json parser
+    # (``"tool_use_id" in W`` — see
+    # test_serialize_multiturn_content_is_block_shaped).
+    assert [m["message"]["content"] for m in parsed] == [
+        [{"type": "text", "text": "make this better"}],
+        [{"type": "text", "text": "turn-1 reply"}],
+        [{"type": "text", "text": "shorter please"}],
+        [{"type": "text", "text": "turn-2 reply"}],
+        [{"type": "text", "text": "more concrete"}],
+    ]
 
 
 def test_three_iterations_each_turn_produces_a_call(make_backend) -> None:

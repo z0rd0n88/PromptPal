@@ -236,13 +236,35 @@ def _is_auth_failure(stderr_text: str) -> bool:
     return any(kw in lower for kw in AUTH_FAILURE_KEYWORDS)
 
 
+def _normalize_content(content: Any) -> Any:
+    """Coerce a turn's ``content`` into the CLI's block-array shape.
+
+    The Claude CLI's ``--input-format=stream-json`` parser scans each
+    message's content blocks for tool markers (``"tool_use_id" in block``)
+    when rebuilding multi-turn history, so ``content`` must be a list of
+    block *objects* — not a bare string. A string makes JavaScriptCore
+    iterate it character-by-character and throw ``W is not an Object.
+    (evaluating '"tool_use_id"in W')``, which surfaces as ``claude exited
+    1`` on the first ``[i]terate`` turn (the single-turn first call slips
+    through because a lone trailing user prompt isn't block-scanned).
+
+    A string is wrapped as a single ``text`` block; an already-list value
+    is forwarded unchanged (idempotent — callers may pass block-shaped
+    content directly); anything else is left as-is so we never mask an
+    unexpected shape with a lossy guess.
+    """
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    return content
+
+
 def _serialize_messages_ndjson(messages: Sequence[dict[str, Any]]) -> bytes:
     """Encode ``messages`` as NDJSON in Claude Code's stream-json input shape.
 
     The Claude CLI's ``--input-format=stream-json`` expects each line to
     be an envelope::
 
-        {"type": "user"|"assistant", "message": {"role": ..., "content": ...}}
+        {"type": "user"|"assistant", "message": {"role": ..., "content": [...]}}
 
     not a bare ``{"role": ..., "content": ...}``. The unwrapped shape is
     silently ignored — claude exits 0 after running its hooks but never
@@ -251,13 +273,21 @@ def _serialize_messages_ndjson(messages: Sequence[dict[str, Any]]) -> bytes:
     ``claude-code 2.1.143``.
 
     Each input ``m`` (PromptPal's internal Messages-API-style shape) is
-    wrapped as ``{"type": m["role"], "message": m}``. Empty list → empty
-    bytes. A trailing newline is appended so the final object terminates
-    cleanly when ``claude`` reads stdin line-by-line.
+    wrapped as ``{"type": m["role"], "message": {**m, "content": ...}}``,
+    with ``content`` normalized to a block array via
+    :func:`_normalize_content` (a new dict is built, never mutating ``m``).
+    Empty list → empty bytes. A trailing newline is appended so the final
+    object terminates cleanly when ``claude`` reads stdin line-by-line.
     """
     if not messages:
         return b""
-    wrapped = [{"type": m["role"], "message": m} for m in messages]
+    wrapped = [
+        {
+            "type": m["role"],
+            "message": {**m, "content": _normalize_content(m.get("content"))},
+        }
+        for m in messages
+    ]
     lines = [json.dumps(w, ensure_ascii=False) for w in wrapped]
     return ("\n".join(lines) + "\n").encode("utf-8")
 
