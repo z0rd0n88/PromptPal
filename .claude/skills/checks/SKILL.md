@@ -12,7 +12,8 @@ Run the project's verification gate and report the result.
 
 ```bash
 uv run --with pyright --with pytest pyright core tests   # type-check (0 errors = clean)
-uv run --with pytest python -m pytest -q                 # full suite (unit + integration)
+uv run --with pytest --with pytest-cov python -m pytest \
+  --cov=core --cov-report=term-missing --cov-fail-under=80 -q   # tests + coverage gate
 ```
 
 ## Notes
@@ -23,7 +24,10 @@ uv run --with pytest python -m pytest -q                 # full suite (unit + in
 - `pyright` needs `--with pytest` so it can resolve test imports — without it you
   get spurious `Import "pytest" could not be resolved` errors.
 - For a fast inner loop, scope tests with `python -m pytest tests/unit -q`
-  (~2s, no subprocess); the integration suite uses fakes too.
+  (~2s, no subprocess); the integration suite uses fakes too. Skip `--cov*` flags
+  for the inner loop — coverage needs the full suite.
+- Coverage gate is **80%** (the policy floor); actual is ~95%. CI enforces the same
+  `--cov-fail-under=80` on every PR.
 
 ## Report
 
