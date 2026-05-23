@@ -27,3 +27,7 @@
   not from this repo. A `git pull` does **not** take effect until `install.sh` re-runs.
 - Use `/reinstall-promptpal` (or `bash .claude/skills/reinstall-promptpal/scripts/reinstall.sh`)
   to pull → re-run `install.sh` → verify the installed snapshot matches the repo.
+
+## Project Architecture
+
+See [`ARCH.md`](./ARCH.md) for the full, auto-maintained file-tree map and component overview — the primary entry point for orienting in this repo. The tree refreshes automatically on every commit via `.githooks/pre-commit`; refresh manually with `python3 .githooks/gen_arch.py`. After cloning, activate the hook once with `git config core.hooksPath .githooks`. Use the `code-explorer` agent for deeper tracing.
