@@ -1,0 +1,120 @@
+# promptpal-total-review configuration. Consumed by
+# ~/.claude/skills/total-review/REFERENCE.md at every invocation.
+
+project:
+  slug: promptpal
+  stack: python
+  repo: z0rd0n88/PromptPal
+  invariants:
+    - "core/ is stdlib-only (PRD D-1/D-2) — no third-party imports, no requirements.txt, no pyproject runtime deps."
+    - "claude-cli stream-json: --bare breaks OAuth; --verbose required; failures land on stdout with empty stderr; message content MUST be a block array, never a bare string."
+    - "User-state files in ~/.promptpal/ are written through core/_io.py atomic helpers — direct open('w') is a silent-failure smell."
+    - "Tests and docstrings pin requirement IDs (P1-AREA-NN) from PRD-PHASE1.md; preserve them on edits."
+    - "Tests run via `uv run --with pytest python -m pytest`; pyright runs via `uv run --with pyright --with pytest pyright core tests` — hardcoded `python -m pytest` is broken on a fresh clone."
+    - "The installed snapshot at ~/.promptpal/lib/ is what `promptpal` actually runs — git pull alone does not take effect; install.sh must re-run."
+
+# Layer slices. Each declared `lenses` list is the per-slice allowlist —
+# only agents in `mode.agents ∩ slice.lenses` actually run on this slice.
+slices:
+  cli:
+    # CLI orchestration layer — flags, exit codes, top-level I/O routing.
+    path: core
+    paths:
+      - core/cli.py
+      - core/main.py
+      - core/__init__.py
+    lenses: [code-reviewer, python-reviewer, python-pro, critical-thinking]
+
+  backends:
+    # Both backend adapters + the abstract base. The fragile part of the codebase
+    # per CLAUDE.md; cli-backend-reviewer is the project-specific lens.
+    path: core
+    paths:
+      - core/backend.py
+      - core/api_backend.py
+      - core/cli_backend.py
+    lenses:
+      - code-reviewer
+      - python-reviewer
+      - python-pro
+      - cli-backend-reviewer
+      - security-reviewer
+      - silent-failure-hunter
+
+  state:
+    # Config + history + system-prompt + atomic I/O — everything that touches
+    # ~/.promptpal/. history-persistence-reviewer is the project-specific lens.
+    path: core
+    paths:
+      - core/config.py
+      - core/history.py
+      - core/system_prompt.py
+      - core/_io.py
+      - core/resolve.py
+    lenses:
+      - code-reviewer
+      - python-reviewer
+      - python-pro
+      - history-persistence-reviewer
+      - security-reviewer
+      - silent-failure-hunter
+
+  loop:
+    # Interactive accept/iterate/discard refinement, diff renderer, input parser.
+    path: core
+    paths:
+      - core/loop.py
+      - core/diff.py
+      - core/input.py
+    lenses: [code-reviewer, python-reviewer, python-pro]
+
+  platform:
+    # Platform detection + winget launcher wiring.
+    path: core
+    paths:
+      - core/platform.py
+      - core/winget_launcher.py
+    lenses: [code-reviewer, python-reviewer, security-reviewer]
+
+  launchers:
+    # Bash launcher, installer/uninstaller, Windows-side launchers, winget manifests.
+    path: .
+    paths:
+      - bin/promptpal
+      - install.sh
+      - uninstall.sh
+      - launcher
+      - promptpal_main.py
+    lenses: [code-reviewer, security-reviewer, critical-thinking]
+
+  tests:
+    # Narrow lens set — idiom reviewers don't fit test code.
+    path: tests
+    lenses: [code-reviewer, tdd-guide]
+
+# Mode overrides — only declare to override canonical defaults from REFERENCE.md.
+modes:
+  # code-architect not parked at user scope (2026-06-07). Drop it from
+  # architecture mode rather than warn on every invocation. silent-failure-hunter
+  # + critical-thinking carry the boundary-check load.
+  architecture:
+    agents: [critical-thinking, silent-failure-hunter]
+
+  # PromptPal has no SQL; strip sql-pro out of perf mode (default would add it
+  # only if *.sql is present, but pin explicitly so future glob changes don't
+  # re-add it).
+  perf:
+    agents: [performance-optimizer, python-pro]
+
+tracker:
+  exclusion_query: |
+    gh issue list --repo z0rd0n88/PromptPal --state open --limit 30 \
+      --label review,tech-debt,security,performance,architecture \
+      --json number,title,body
+  file_issue: |
+    gh issue create --repo z0rd0n88/PromptPal --title "{title}" --body-file - \
+      --label review
+  title_template: "{mode} review: {crit} CRITICAL · {high} HIGH · {med} MEDIUM · {low} LOW"
+  # PromptPal has no meta-tracker issue. Cross-ref individual issues by hand
+  # in the body when reviewers find related items.
+  cross_ref_phrase: ""
