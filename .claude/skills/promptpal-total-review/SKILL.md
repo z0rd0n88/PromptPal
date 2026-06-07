@@ -1,6 +1,6 @@
 ---
 name: promptpal-total-review
-description: Multi-agent codebase review for PromptPal (stdlib-only Python CLI, dual backends). Modes — code, cleanup, security, architecture, test, perf, docs, pre-pr. Triggers on /promptpal-total-review or "review pass", "security sweep", "architecture audit", "pre-PR triage".
+description: Multi-agent codebase review for PromptPal (stdlib-only Python, dual backends). Triggers on /promptpal-total-review.
 ---
 
 # promptpal-total-review
@@ -26,7 +26,7 @@ These supplement the global REFERENCE.md guidance; reviewers should treat them a
 In addition to OWASP A01–A10:
 - **Prompt-injection via raw input** — the user-supplied prompt is concatenated with the system prompt and forwarded to the backend; reviewers should check for injection escape paths (especially in the iterate loop, where the model's output re-enters the next turn).
 - **Filesystem traversal in user-state paths** — `~/.promptpal/` contents (history, config, system-prompt overrides) are user-writable. Any path joined under there with attacker-influenced filenames needs traversal checks.
-- **Untrusted JSON from external CLIs** — `claude` stream-json output is parsed; malformed/hostile NDJSON should fail closed.
+- **Untrusted JSON from external CLIs** — `claude` stream-json output is parsed line-by-line by `_parse_stream_json`, which **drops unparseable lines by design** (fail-open on individual NDJSON lines so a single bad line doesn't abort response assembly). The adversary therefore is: *a hostile line must not raise out of the parser AND must not inject into the assembled assistant output*. Additionally, the request side: a malformed envelope (e.g. bare `{"role": ...}` instead of `{"type": role, "message": {...}}`) produces a **silent success** — `claude` exits 0 with empty assistant output and no error code. Reviewers should flag any code path that treats exit 0 + empty output as "model declined" rather than "envelope shape regressed".
 - **Env-var injection into subprocess argv** — config-driven flags piped into `claude` argv must not enable shell metacharacter abuse.
 - **HOME-hijack via WSL/Windows path bleed** — the `bin/promptpal` launcher guards against a misrouted `HOME`; bypasses there leak credentials into `/mnt/c/...`.
 
@@ -47,9 +47,22 @@ In addition to OWASP A01–A10:
 
 ## Notes on agent availability
 
-- `code-architect` is **not parked at user scope** as of 2026-06-07. `architecture` mode falls back to `critical-thinking` + `silent-failure-hunter` only. Activate from a sibling repo (e.g. Friendex's `.claude/agents/ecc-code-architect.md`) when deeper boundary-checking is needed.
-- `code-explorer` is not parked at user scope; mapping for `code`/`architecture`/`perf` modes falls back to the built-in `Explore` subagent type if no project-level `code-explorer.md` exists.
-- Two PromptPal-specific lenses are activated: `cli-backend-reviewer` (the `claude` argv + stream-json layer) and `history-persistence-reviewer` (the `~/.promptpal/history` writer). They join `code` and `architecture` modes on the `backends` and `state` slices respectively.
+- `ecc-code-explorer` and `ecc-code-architect` are parked at user scope as of 2026-06-07 and activated in this project under `.claude/agents/`. They light up automatically wherever `code-explorer` / `code-architect` appear in mode defaults or slice `lenses`.
+- Two PromptPal-specific lenses are activated: `cli-backend-reviewer` (the `claude` argv + stream-json layer) and `history-persistence-reviewer` (the `~/.promptpal/history` writer). They join `code` and `architecture` modes additively via `agents_add` in `config.yml`; per-slice `lenses` allowlists decide where they run. `cli-backend-reviewer` also appears in `tests.lenses` to catch fake-parity drift between the production backends and their `tests/` fakes.
+- **Tool-capability split:** fix-capable agents (`python-pro`, `ecc-tdd-guide`, `ecc-refactor-cleaner`, `unused-code-cleaner`) deliberately retain `Write` / `Edit` so they can author tests and execute refactors in fix-pass dispatches, while pure-review agents (`ecc-security-reviewer`, `ecc-performance-optimizer`, `ecc-python-reviewer`, `ecc-silent-failure-hunter`, `critical-thinking`) are stripped to read-only.
+
+## Slice quick-reference
+
+The `config.yml` declares seven layer slices:
+
+- `cli` — `core/cli.py`, `core/main.py`, `core/__init__.py`, **`core/resolve.py`** (moved here from `state` 2026-06-07; it's a path resolver, not a state writer). Lenses include `silent-failure-hunter` (owns the exit-code / error funnel) and `code-architect`.
+- `backends` — both backend adapters + the abstract base. The fragile part per CLAUDE.md.
+- `state` — config + history + system-prompt + atomic I/O (everything writing to `~/.promptpal/`).
+- `loop` — interactive accept/iterate/discard, diff renderer, input parser. `silent-failure-hunter` joins here for parity with `backends`/`state`.
+- `platform` — platform detection + winget launcher wiring.
+- **`launchers_shell`** — bash launcher + installer/uninstaller + Windows shell launchers (`bin/promptpal`, `install.sh`, `uninstall.sh`, `launcher/promptpal.cmd`, `launcher/promptpal.ps1`). Split off from the old monolithic `launchers` slice 2026-06-07.
+- **`packaging`** — winget manifests + the Python entry-point shim (`promptpal_main.py`). Other half of the old `launchers` split — distinct lens set (`python-reviewer` joins for the shim).
+- `tests` — narrow lens set + `cli-backend-reviewer` for fake-parity drift coverage.
 
 ## No-SQL note
 
