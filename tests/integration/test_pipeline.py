@@ -320,8 +320,12 @@ def test_iterate_empty_feedback_prints_notice_to_stderr():
         stderr=stderr,
     )
     err = stderr.getvalue()
-    assert "empty" in err.lower(), (
+    assert "no feedback" in err.lower() or "empty" in err.lower(), (
         f"expected empty-feedback notice on stderr; got: {err!r}"
+    )
+    # Must be ASCII-safe — em-dash would crash on cp1252 / LANG=C terminals.
+    assert "—" not in err, (
+        "M17 notice must use ASCII hyphen, not em-dash, for terminal safety"
     )
 
 
