@@ -77,7 +77,14 @@ from core.system_prompt import (
 
 
 class FakeBackend(Backend):
-    """Backend that pops responses off a queue; records every call."""
+    """Backend that pops responses off a queue; records every call.
+
+    H11 (issue #30): records ``stream`` so a regression in the loop
+    that changes which value is passed is caught at assertion time.
+    H12: ``calls[n][1]`` holds the pre-serialization messages shape;
+    the wire-shape normalization (block-array content) is pinned by
+    the unit tests in ``tests/unit/test_cli_backend_streamjson.py``.
+    """
 
     def __init__(
         self,
@@ -89,7 +96,8 @@ class FakeBackend(Backend):
         self._responses = list(responses)
         self._name = name
         self._auth_ok = auth_ok
-        self.calls: list[tuple[str, list[dict]]] = []
+        # Each entry: (system, messages, stream).
+        self.calls: list[tuple[str, list[dict], bool]] = []
 
     @property
     def name(self) -> str:
@@ -98,7 +106,7 @@ class FakeBackend(Backend):
     def complete(
         self, system: str, messages: list[Message], stream: bool = False
     ) -> BackendResponse:
-        self.calls.append((system, list(messages)))
+        self.calls.append((system, list(messages), stream))
         if not self._responses:
             raise AssertionError("FakeBackend: out of responses")
         return self._responses.pop(0)
@@ -1249,7 +1257,7 @@ class TestReplay:
         # Backend was called once (the iterate) with 3 prior messages:
         # the source's user turn + assistant turn + the new user feedback.
         assert len(backend.calls) == 1
-        _system, messages = backend.calls[0]
+        _system, messages, _stream = backend.calls[0]
         assert len(messages) == 3
         assert messages[0] == {"role": "user", "content": "the original prompt"}
         assert messages[1] == {

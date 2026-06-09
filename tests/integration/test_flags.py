@@ -69,7 +69,12 @@ from core.platform import Platform
 
 
 class FakeBackend(Backend):
-    """Backend that pops responses off a queue and records every call."""
+    """Backend that pops responses off a queue and records every call.
+
+    H11 + H12 (issue #30): records ``stream`` in every call; see
+    the docstring on ``tests/integration/test_pipeline.py::FakeBackend``
+    for the pre-serialization-shape rationale.
+    """
 
     def __init__(
         self,
@@ -81,7 +86,8 @@ class FakeBackend(Backend):
         self._responses = list(responses)
         self._name = name
         self._auth_ok = auth_ok
-        self.calls: list[tuple[str, list[dict]]] = []
+        # Each entry: (system, messages, stream).
+        self.calls: list[tuple[str, list[dict], bool]] = []
 
     @property
     def name(self) -> str:
@@ -90,7 +96,7 @@ class FakeBackend(Backend):
     def complete(
         self, system: str, messages: list[Message], stream: bool = False
     ) -> BackendResponse:
-        self.calls.append((system, list(messages)))
+        self.calls.append((system, list(messages), stream))
         if not self._responses:
             raise AssertionError("FakeBackend: response queue exhausted")
         return self._responses.pop(0)
