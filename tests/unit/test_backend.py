@@ -118,7 +118,7 @@ def test_minimal_concrete_backend_satisfies_contract():
         def complete(
             self,
             system: str,
-            messages: list[dict],
+            messages: list[Message],
             stream: bool = False,
         ) -> BackendResponse:
             return BackendResponse(text="ok", input_tokens=1, output_tokens=2)

@@ -44,7 +44,7 @@ from pathlib import Path
 
 import pytest
 
-from core.backend import Backend, BackendResponse
+from core.backend import Backend, BackendResponse, Message
 from core.cli import (
     EXIT_FAILURE,
     EXIT_OK,
@@ -88,7 +88,7 @@ class FakeBackend(Backend):
         return self._name
 
     def complete(
-        self, system: str, messages: list[dict], stream: bool = False
+        self, system: str, messages: list[Message], stream: bool = False
     ) -> BackendResponse:
         self.calls.append((system, list(messages)))
         if not self._responses:
@@ -365,7 +365,7 @@ class TestSystemPromptFlag:
         captured: list[str] = []
 
         class CapturingBackend(FakeBackend):
-            def complete(self, system: str, messages: list[dict], stream: bool = False) -> BackendResponse:
+            def complete(self, system: str, messages: list[Message], stream: bool = False) -> BackendResponse:
                 captured.append(system)
                 return super().complete(system, messages, stream)
 
@@ -581,7 +581,7 @@ class _CapturingBackend(FakeBackend):
         self.systems: list[str] = []
 
     def complete(
-        self, system: str, messages: list[dict], stream: bool = False
+        self, system: str, messages: list[Message], stream: bool = False
     ) -> BackendResponse:
         self.systems.append(system)
         return super().complete(system, messages, stream)

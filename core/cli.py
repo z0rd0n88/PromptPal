@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import TextIO
 
 from core.api_backend import ApiKeyMissingError
-from core.backend import Backend, NoBackendError
+from core.backend import Backend, Message, NoBackendError
 from core.cli_backend import CliNotFoundError
 from core.config import (
     Config,
@@ -589,7 +589,7 @@ def cmd_export(
 # ---------------------------------------------------------------------------
 
 
-def _seed_messages_from_session(session: Session) -> tuple[list[dict[str, str]], str]:
+def _seed_messages_from_session(session: Session) -> tuple[list[Message], str]:
     """Replay a saved session's turns into a fresh ``messages`` list.
 
     Returns ``(messages, last_assistant_text)``. The ``messages`` list
@@ -603,7 +603,7 @@ def _seed_messages_from_session(session: Session) -> tuple[list[dict[str, str]],
     (defensive — shouldn't appear in real sessions) are dropped silently
     rather than crashing the replay.
     """
-    messages: list[dict[str, str]] = []
+    messages: list[Message] = []
     last_assistant: str | None = None
     for t in session.turns:
         if t.role not in ("user", "assistant"):
@@ -1030,7 +1030,7 @@ def _run_pipeline(
         return EXIT_FAILURE
     system = apply_xml_tags_directive(system, enabled=options.xml_tags)
 
-    initial_messages: list[dict[str, str]] = [
+    initial_messages: list[Message] = [
         {"role": "user", "content": original_prompt}
     ]
 

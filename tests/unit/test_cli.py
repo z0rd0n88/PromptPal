@@ -28,7 +28,7 @@ from typing import Callable
 
 import pytest
 
-from core.backend import Backend, BackendResponse, NoBackendError
+from core.backend import Backend, BackendResponse, Message, NoBackendError
 from core.cli import (
     BACKEND_API,
     BACKEND_AUTO,
@@ -96,7 +96,7 @@ class FakeBackend(Backend):
         return self._name
 
     def complete(
-        self, system: str, messages: list[dict], stream: bool = False
+        self, system: str, messages: list[Message], stream: bool = False
     ) -> BackendResponse:
         self.calls.append((system, list(messages)))
         if not self._responses:

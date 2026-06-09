@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeAlias
 
 
 #: One message on the wire between PromptPal and a backend.
@@ -27,7 +27,7 @@ from typing import Any
 #: ``dict[str, Any]`` rather than ``TypedDict`` because the value shape
 #: is heterogeneous; the alias is a documentation hook so a future
 #: tightening to ``TypedDict`` lands in one place.
-Message = dict[str, Any]
+Message: TypeAlias = dict[str, Any]
 
 
 @dataclass(frozen=True)

@@ -56,7 +56,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Generator, Iterable, Iterator
+from collections.abc import Generator, Iterable
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -206,8 +206,17 @@ def _iter_sse(resp: Any) -> Generator[dict, None, None]:
         if callable(close):
             try:
                 close()
-            except Exception:
-                pass
+            except Exception as e:
+                # Swallowing here is load-bearing: an exception in a
+                # generator's ``finally`` replaces the in-flight exception
+                # from the loop body (RuntimeError chained over the
+                # original), erasing the real failure. We still leave a
+                # stderr trace so a misbehaving transport isn't fully
+                # invisible — matches the ``_safe_unlink`` precedent.
+                print(
+                    f"warning: error closing SSE response: {e}",
+                    file=sys.stderr,
+                )
 
 
 def _default_transport(
