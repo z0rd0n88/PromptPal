@@ -30,6 +30,7 @@ from core.history import (
     INDEX_FILE_NAME,
     AmbiguousSessionIdError,
     IndexEntry,
+    InvalidSessionIdError,
     ORIGINAL_PROMPT_PREVIEW_LIMIT,
     STATUS_ACCEPTED,
     STATUS_DISCARDED,
@@ -450,8 +451,81 @@ def test_resolve_ignores_index_json(tmp_path):
         resolve_session_id("index", tmp_path)
 
 
+def test_resolve_session_id_glob_filters_symlinks(tmp_path):
+    """M12 (issue #30): a UUID-named symlink in ``history_dir`` must not
+    pollute the prefix-scan glob.
+
+    The pre-fix glob included any ``<uuid>.json``-shaped entry, including
+    a symlink pointing at an arbitrary file outside ``history_dir`` —
+    ``resolve_session_id`` would then resolve the prefix to it and
+    ``read_session`` would dereference and read the target. With the
+    symlink filter, the symlink is invisible to prefix resolution.
+    """
+    real = tmp_path / "abc12345af81440ca0f1e7085dadf89d.json"
+    real.write_text(
+        json.dumps(_make_session(session_id="abc12345af81440ca0f1e7085dadf89d").to_dict()),
+        encoding="utf-8",
+    )
+
+    # Symlink shaped like a session file but pointing somewhere unrelated.
+    target_outside = tmp_path / "elsewhere.txt"
+    target_outside.write_text("not a session", encoding="utf-8")
+    link = tmp_path / "abc67890af81440ca0f1e7085dadf89d.json"
+    link.symlink_to(target_outside)
+
+    # Prefix 'abc' matches both real and link — symlink filter must drop
+    # the link, leaving only the real session as the match.
+    assert (
+        resolve_session_id("abc", tmp_path)
+        == "abc12345af81440ca0f1e7085dadf89d"
+    )
+
+
 def test_session_path_helper_uses_uuid_naming(tmp_path):
     assert session_path(tmp_path, "abc") == tmp_path / "abc.json"
+
+
+# ---------------------------------------------------------------------------
+# H1 — session_path containment check (issue #30)
+# ---------------------------------------------------------------------------
+
+
+def test_session_path_rejects_parent_dir_traversal(tmp_path):
+    """H1: a ``session_id`` of ``../../etc/passwd`` must not escape
+    ``history_dir`` via ``Path.joinpath`` semantics.
+
+    Auto-generated UUID-hex ids never trigger this, but CLI-supplied ids
+    (``--resume <id>``) and ids read from a corrupted ``index.json`` are
+    user-controlled — without a containment check, ``session_path`` is a
+    file-write primitive anywhere on disk the process can reach.
+    """
+    with pytest.raises(InvalidSessionIdError):
+        session_path(tmp_path, "../../etc/passwd")
+
+
+def test_session_path_rejects_nested_session_id(tmp_path):
+    """H1: nested-directory session_ids (``foo/bar``) must also reject.
+
+    Sessions are intentionally flat one-file-per-id; even a non-traversal
+    nested id like ``foo/bar`` is invalid because ``read_session`` /
+    ``resolve_session_id`` / ``enforce_max_entries`` all assume the flat
+    shape.
+    """
+    with pytest.raises(InvalidSessionIdError):
+        session_path(tmp_path, "foo/bar")
+
+
+def test_session_path_rejects_absolute_session_id(tmp_path):
+    """H1: an absolute path as ``session_id`` would replace ``history_dir``
+    entirely under ``Path /`` semantics. Reject."""
+    with pytest.raises(InvalidSessionIdError):
+        session_path(tmp_path, "/etc/passwd")
+
+
+def test_session_path_accepts_valid_hex_id(tmp_path):
+    """H1: regular UUID-hex ids work exactly as before — no false positives."""
+    result = session_path(tmp_path, "b4449351af81440ca0f1e7085dadf89d")
+    assert result == tmp_path / "b4449351af81440ca0f1e7085dadf89d.json"
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +585,59 @@ def test_read_index_tolerates_truncated_json(tmp_path):
     """
     (tmp_path / INDEX_FILE_NAME).write_bytes(b"not json{")
     assert read_index(tmp_path) == []
+
+
+def test_read_index_skips_non_dict_entries(tmp_path):
+    """H3 (issue #30): a non-dict element inside the list must be skipped,
+    not crash the read.
+
+    The pre-fix ``[IndexEntry.from_dict(d) for d in data]`` raises
+    ``KeyError``/``TypeError`` on the first bad row, aborting the entire
+    index load. The docstring promises "corrupt file → empty list" but
+    only the file-level and root-level checks honored it. Per-entry
+    tolerance brings the behavior into line.
+    """
+    good_row = {
+        "session_id": "abc12345",
+        "created_at": "2026-05-01T00:00:00Z",
+        "label": None,
+        "status": STATUS_IN_PROGRESS,
+        "original_prompt_preview": "p",
+    }
+    payload = json.dumps([good_row, "string-not-dict", None, ["list-not-dict"], 42])
+    (tmp_path / INDEX_FILE_NAME).write_text(payload, encoding="utf-8")
+    entries = read_index(tmp_path)
+    assert len(entries) == 1
+    assert entries[0].session_id == "abc12345"
+
+
+def test_read_index_skips_dict_with_missing_required_keys(tmp_path):
+    """H3: a dict missing required keys is skipped, not crash-raised.
+
+    ``IndexEntry.from_dict`` does ``data["session_id"]`` / ``data["created_at"]``
+    / ``data["status"]`` — KeyError on any missing one. With per-entry
+    guards, just the bad row drops; the rest of the index loads.
+    """
+    good_row = {
+        "session_id": "abc12345",
+        "created_at": "2026-05-01T00:00:00Z",
+        "label": None,
+        "status": STATUS_IN_PROGRESS,
+        "original_prompt_preview": "p",
+    }
+    bad_row_missing_id = {
+        "created_at": "2026-05-01T00:00:00Z",
+        "status": STATUS_IN_PROGRESS,
+    }
+    bad_row_missing_status = {
+        "session_id": "def67890",
+        "created_at": "2026-05-01T00:00:00Z",
+    }
+    payload = json.dumps([good_row, bad_row_missing_id, bad_row_missing_status])
+    (tmp_path / INDEX_FILE_NAME).write_text(payload, encoding="utf-8")
+    entries = read_index(tmp_path)
+    assert len(entries) == 1
+    assert entries[0].session_id == "abc12345"
 
 
 def test_write_index_atomic_no_temp_leftovers(tmp_path):

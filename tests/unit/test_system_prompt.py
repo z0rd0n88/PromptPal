@@ -192,6 +192,46 @@ def test_seed_preserves_lf_line_endings(tmp_path):
     assert target.read_bytes() == BUNDLED_SYSTEM_PROMPT_PATH.read_bytes()
 
 
+def test_seed_creates_file_with_0600_mode(tmp_path):
+    """H2 (issue #30): seeded file must be 0600 (NFR-08 / P1-PLAT-08).
+
+    On a multi-user POSIX box, ``~/.promptpal/system-prompt.md`` may
+    contain user-customized prompt text — group/other-readable defeats
+    the purpose of putting it in the user's home dir. The slice-1 fix
+    locked the system-prompt *tempfile* to 0600 via ``mkstemp``; this
+    finding extends the same contract to the user-state file itself by
+    routing through the same primitive (open with explicit mode arg) +
+    ``O_CREAT|O_EXCL`` race-safety instead of ``shutil.copyfile`` which
+    inherits the umask.
+    """
+    target = tmp_path / "system-prompt.md"
+    seed_system_prompt(target)
+    assert (target.stat().st_mode & 0o777) == 0o600
+
+
+def test_seed_returns_false_when_race_planted_file_after_check(tmp_path, monkeypatch):
+    """H2: the pre-fix ``exists()``-then-``copyfile`` had a TOCTOU window —
+    if another process created the target between the check and the copy,
+    we silently clobbered it. The fix replaces the exists() check with
+    ``O_CREAT|O_EXCL`` so the kernel atomically refuses to create a file
+    that now exists.
+
+    Simulated by patching ``Path.exists`` to a stale ``False`` while the
+    target file actually contains user content. With the O_EXCL guard,
+    the seed must return ``False`` and leave the file untouched.
+    """
+    target = tmp_path / "system-prompt.md"
+    target.write_text("USER CONTENT\n", encoding="utf-8")
+
+    # Stale exists() that lies — but O_EXCL on the open call will catch it
+    # at the syscall level and return False without touching the file.
+    monkeypatch.setattr(Path, "exists", lambda self: False)
+
+    did_seed = seed_system_prompt(target)
+    assert did_seed is False
+    assert target.read_text(encoding="utf-8") == "USER CONTENT\n"
+
+
 # ---------------------------------------------------------------------------
 # AC #6 — resolve_system_prompt_path
 # ---------------------------------------------------------------------------

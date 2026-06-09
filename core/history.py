@@ -127,6 +127,16 @@ class AmbiguousSessionIdError(HistoryError):
         )
 
 
+class InvalidSessionIdError(SessionNotFoundError):
+    """Raised when a session_id would escape ``history_dir`` on join.
+
+    Inherits :class:`SessionNotFoundError` so existing ``--resume`` /
+    ``--export`` error handlers cover it without code change; the
+    distinct class lets tests pin the path-traversal guard separately
+    from a genuine "not found" miss.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Data classes (frozen — immutable session shape, AC for safe replay)
 # ---------------------------------------------------------------------------
@@ -375,8 +385,35 @@ def finalize_session(
 
 
 def session_path(history_dir: Path, session_id: str) -> Path:
-    """Return ``<history_dir>/<session_id>.json`` (P1-HIST-01)."""
-    return Path(history_dir) / f"{session_id}{SESSION_FILE_SUFFIX}"
+    """Return ``<history_dir>/<session_id>.json`` (P1-HIST-01).
+
+    Validates that the joined path lives directly inside ``history_dir``
+    — a ``session_id`` of ``../../etc/passwd`` would otherwise escape via
+    ``Path /`` semantics (``Path("/h") / "/etc/passwd"`` collapses to
+    ``Path("/etc/passwd")`` entirely; ``Path("/h") / "../../etc/passwd"``
+    resolves to ``/etc/passwd``). UUID-hex ids from
+    :func:`_default_id_factory` are safe by construction, but ids that
+    flow through ``--resume <id>`` or a corrupted ``index.json`` are
+    user-controlled and must not become a file-write primitive anywhere
+    on disk.
+
+    The check is "resolved parent must equal resolved ``history_dir``"
+    rather than "starts with" so nested-directory ids (``foo/bar``) are
+    also rejected — sessions are intentionally flat, one file per id.
+
+    Raises :class:`InvalidSessionIdError` (a :class:`SessionNotFoundError`
+    subclass) when the containment check fails.
+    """
+    history_dir = Path(history_dir)
+    candidate = history_dir / f"{session_id}{SESSION_FILE_SUFFIX}"
+    history_resolved = history_dir.resolve()
+    candidate_resolved = candidate.resolve()
+    if candidate_resolved.parent != history_resolved:
+        raise InvalidSessionIdError(
+            f"Session id {session_id!r} would escape history directory "
+            f"{history_dir}"
+        )
+    return candidate
 
 
 def index_path(history_dir: Path) -> Path:
@@ -451,7 +488,9 @@ def resolve_session_id(id_or_prefix: str, history_dir: str | Path) -> str:
     matches = sorted(
         p.stem
         for p in history_dir.glob(f"*{SESSION_FILE_SUFFIX}")
-        if p.name != INDEX_FILE_NAME and p.stem.startswith(id_or_prefix)
+        if p.name != INDEX_FILE_NAME
+        and not p.is_symlink()
+        and p.stem.startswith(id_or_prefix)
     )
     if len(matches) == 1:
         return matches[0]
@@ -490,11 +529,15 @@ def index_entry_from_session(session: Session) -> IndexEntry:
 def read_index(history_dir: str | Path) -> list[IndexEntry]:
     """Read the newest-first index. Missing/corrupt file → empty list.
 
-    A truncated, non-JSON, or non-list ``index.json`` returns ``[]``
-    instead of raising — corruption must not abort the run (P1-FIX-28-06
-    / P1-HIST-08). The ``_try_write_session`` warning helper only
-    catches ``OSError``, so handling decode errors at the read site
-    keeps :func:`read_index` uniformly tolerant.
+    A truncated, non-JSON, non-list-root, or per-row malformed
+    ``index.json`` returns the longest valid prefix of rows it can
+    salvage instead of raising — corruption must not abort the run
+    (P1-FIX-28-06 / P1-HIST-08).
+
+    Per-entry tolerance: each list element is filtered through
+    ``isinstance(d, dict)`` first, and :func:`IndexEntry.from_dict`'s
+    ``KeyError`` / ``TypeError`` failures are swallowed — one bad row
+    must not orphan the rest of the index.
     """
     target = index_path(Path(history_dir))
     if not target.exists():
@@ -505,7 +548,15 @@ def read_index(history_dir: str | Path) -> list[IndexEntry]:
         return []
     if not isinstance(data, list):
         return []
-    return [IndexEntry.from_dict(d) for d in data]
+    entries: list[IndexEntry] = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        try:
+            entries.append(IndexEntry.from_dict(row))
+        except (KeyError, TypeError):
+            continue
+    return entries
 
 
 def write_index(entries: list[IndexEntry], history_dir: str | Path) -> Path:
