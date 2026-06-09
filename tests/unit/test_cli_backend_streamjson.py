@@ -310,6 +310,39 @@ def test_system_prompt_tempfile_helper_uses_lf_endings(tmp_path) -> None:
         os.unlink(path)
 
 
+def test_write_system_prompt_tempfile_closes_raw_fd_when_fdopen_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C2 mirror: ``_write_system_prompt_tempfile`` uses the same
+    ``tempfile.mkstemp`` + ``os.fdopen`` pair as ``core._io.atomic_write_bytes``.
+
+    If ``os.fdopen`` raises before adopting the raw fd (e.g. under
+    fd-table exhaustion / EMFILE), the cleanup branch must call ``os.close(fd)``
+    or the system-prompt path leaks fds on every retry — exactly the situation
+    where leaking more fds matters most.
+    """
+    closed_fds: list[int] = []
+    real_close = os.close
+
+    def hooked_close(fd: int) -> None:
+        closed_fds.append(fd)
+        real_close(fd)
+
+    def hooked_fdopen(fd: int, *args, **kwargs):  # type: ignore[no-untyped-def]
+        raise OSError(24, "Too many open files")  # EMFILE
+
+    monkeypatch.setattr("core.cli_backend.os.close", hooked_close)
+    monkeypatch.setattr("core.cli_backend.os.fdopen", hooked_fdopen)
+
+    with pytest.raises(OSError, match="Too many open files"):
+        _write_system_prompt_tempfile("anything")
+
+    assert closed_fds, (
+        "fd from mkstemp must be os.close'd when os.fdopen raises before "
+        "adopting it; got no os.close calls"
+    )
+
+
 # ---------------------------------------------------------------------------
 # AC #2 — NDJSON stdin
 # ---------------------------------------------------------------------------

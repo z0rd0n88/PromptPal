@@ -351,6 +351,63 @@ def test_save_config_accepts_string_path(tmp_path):
     assert (tmp_path / "config.json").is_file()
 
 
+def test_save_config_preserves_dataclass_declaration_order(tmp_path):
+    """M10: ``save_config`` must emit fields in dataclass declaration order.
+
+    ``Config.field_names()`` returns a ``frozenset`` whose iteration order is
+    insertion-order in current CPython but **not guaranteed** by the language
+    spec. Iterating ``dataclasses.fields(cfg)`` is documented as declaration
+    order. Anchoring the on-disk shape here prevents spurious diffs for users
+    who track ``config.json`` in their dotfile repo.
+    """
+    from dataclasses import fields as dc_fields
+
+    path = tmp_path / "config.json"
+    save_config(Config(), path)
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    expected = [f.name for f in dc_fields(Config())]
+    assert list(on_disk.keys()) == expected
+
+
+def test_save_config_is_byte_stable_across_runs(tmp_path):
+    """M10: re-saving the same Config must produce byte-identical output.
+
+    Pairs with the declaration-order test above: ordering deterministic +
+    serialization deterministic = a clean ``git diff`` after every CLI run.
+    """
+    path1 = tmp_path / "a.json"
+    path2 = tmp_path / "b.json"
+    save_config(Config(), path1)
+    save_config(Config(), path2)
+    assert path1.read_bytes() == path2.read_bytes()
+
+
+# ---------------------------------------------------------------------------
+# US-002 — TOCTOU tolerance in load_config (M9)
+# ---------------------------------------------------------------------------
+
+
+def test_load_config_tolerates_file_removed_between_exists_and_read(
+    tmp_path, monkeypatch
+):
+    """M9: ``load_config`` must close the TOCTOU window between ``exists()``
+    and ``read_text()`` by relying on ``read_text`` directly and catching
+    ``FileNotFoundError``.
+
+    If the file vanishes in the race window — e.g. another process running
+    ``--clear-config`` or the user running ``rm`` — the current code lets the
+    ``FileNotFoundError`` from ``read_text`` propagate uncaught, surfacing as
+    a bare ``OSError`` instead of the documented "missing file → defaults"
+    behavior (and certainly not the documented ``ConfigCorruptError``).
+    """
+    path = tmp_path / "config.json"
+    # File doesn't exist on disk; simulate the race by forcing exists() True
+    # so read_text is reached and then raises FileNotFoundError.
+    monkeypatch.setattr(Path, "exists", lambda self: True)
+    cfg = load_config(path)
+    assert cfg == Config()
+
+
 # ---------------------------------------------------------------------------
 # US-002 — ConfigCorruptError
 # ---------------------------------------------------------------------------

@@ -203,11 +203,19 @@ def load_config(path: str | Path) -> Config:
     - Missing file → ``Config()`` (no error).
     - Valid JSON object → :func:`apply_overrides` applied to ``Config()``.
     - Corrupt JSON or non-object root → :class:`ConfigCorruptError`.
+
+    Reads the file with a single ``read_text`` call and catches
+    ``FileNotFoundError`` directly — the older ``exists()``-then-``read_text``
+    shape carried a TOCTOU window where a concurrent ``--clear-config``
+    or external ``rm`` between the two calls would surface as an
+    uncaught ``OSError`` instead of the documented "missing → defaults"
+    behavior.
     """
     path_obj = Path(path)
-    if not path_obj.exists():
+    try:
+        raw = path_obj.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return Config()
-    raw = path_obj.read_text(encoding="utf-8")
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
@@ -233,10 +241,15 @@ def save_config(cfg: Config, path: str | Path) -> None:
     The payload is serialized to JSON with ``indent=2`` and a trailing
     newline so the file is human-readable and matches the convention
     used by ``defaults/config.json``.
+
+    Iterates ``dataclasses.fields(cfg)`` directly (rather than
+    ``Config.field_names()``, which returns a ``frozenset``) so the
+    on-disk key order is the dataclass declaration order. Frozenset
+    iteration order is insertion-order in current CPython but not
+    guaranteed by the language; pinning the order here avoids spurious
+    diffs for users who track ``config.json`` in their dotfile repo.
     """
     path_obj = Path(path)
-    payload: dict[str, Any] = {
-        name: getattr(cfg, name) for name in Config.field_names()
-    }
+    payload: dict[str, Any] = {f.name: getattr(cfg, f.name) for f in fields(cfg)}
     body = (json.dumps(payload, indent=2) + "\n").encode("utf-8")
     atomic_write_bytes(path_obj, body, prefix=".config-", suffix=".json")

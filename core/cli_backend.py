@@ -542,10 +542,21 @@ def _write_system_prompt_tempfile(system: str) -> str:
     LF line endings (NFR-08 / P1-PLAT-08). ``mkstemp`` already opens
     with mode 0600 on POSIX, which keeps a multi-user box from reading
     the user's custom prompt.
+
+    The raw fd returned by ``tempfile.mkstemp`` is closed explicitly if
+    ``os.fdopen`` raises before adopting it (e.g. under fd-table
+    exhaustion / EMFILE). Without this guard, the failure would leak a
+    file descriptor on every retry — compounding the exhaustion exactly
+    when more open fds matter most.
     """
     fd, path = tempfile.mkstemp(prefix="promptpal-syspr-", suffix=".md")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+        try:
+            f = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        except BaseException:
+            os.close(fd)
+            raise
+        with f:
             f.write(system)
     except Exception:
         _safe_unlink(path)
