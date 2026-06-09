@@ -37,7 +37,11 @@ WSL_UBUNTU_MISSING_MESSAGE: str = (
 """Stderr message printed by the launcher when WSL Ubuntu is not installed (AC-WINGET-01)."""
 
 WSL_FORWARD_COMMAND: str = "wsl.exe -d Ubuntu -- promptpal"
-"""Canonical forward shape used by the launcher when WSL Ubuntu is present (AC-WINGET-02)."""
+"""Static prefix of the launcher's forward command when WSL Ubuntu is present
+(AC-WINGET-02). The runtime launcher in ``launcher/promptpal.ps1`` appends
+``@args`` after this prefix; the L11 (issue #30) clarification is that this
+constant encodes the prefix only — it is not a complete shell command and
+the test fence is a substring match, not an equality check."""
 
 WINGET_PACKAGE_IDENTIFIER: str = "PromptPal.PromptPal"
 """winget package identifier — must match all three manifest files."""

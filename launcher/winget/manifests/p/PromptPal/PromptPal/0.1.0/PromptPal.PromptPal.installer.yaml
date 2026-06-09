@@ -8,8 +8,23 @@
 # Ubuntu `promptpal` binary (NFR-12).
 #
 # Replace InstallerUrl/InstallerSha256 with the actual release artifact
-# values when cutting a tagged release. The zero-hash placeholder below
-# is intentionally invalid so an accidental publish fails fast.
+# values when cutting a tagged release.
+#
+# H9 (issue #30): the InstallerSha256 placeholder is 64 X's — a
+# STRUCTURALLY INVALID 64-character value that fails the winget
+# ^[A-Fa-f0-9]{64}$ pattern. ``winget validate`` rejects this manifest
+# locally so an accidental publish fails fast at validation time,
+# unlike the previous zero-hash placeholder which was syntactically
+# valid hex and only failed at install time on the end user's machine.
+#
+# NestedInstallerFiles declares BOTH promptpal.cmd (the alias entry
+# point) and promptpal.ps1 (which the .cmd execs at runtime) per H10
+# — declaring the .ps1 makes the manifest internally consistent with
+# the actual launcher topology. winget's extraction behavior for a
+# manifest that declares a file missing from the zip is not formally
+# documented; the safer fix is to keep the manifest honest about every
+# launcher file so a release-workflow audit (and any future winget
+# tooling that does verify per-file presence) can flag the mismatch.
 
 PackageIdentifier: PromptPal.PromptPal
 PackageVersion: 0.1.0
@@ -24,9 +39,10 @@ Installers:
     InstallerType: zip
     NestedInstallerType: portable
     InstallerUrl: https://github.com/z0rd0n88/PromptPal/releases/download/v0.1.0/promptpal-launcher-0.1.0.zip
-    InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
+    InstallerSha256: XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
     NestedInstallerFiles:
       - RelativeFilePath: promptpal.cmd
         PortableCommandAlias: promptpal
+      - RelativeFilePath: promptpal.ps1
 ManifestType: installer
 ManifestVersion: 1.6.0
