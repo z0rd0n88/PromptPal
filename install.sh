@@ -138,10 +138,14 @@ exec python3 "\${PROMPTPAL_LIB}/promptpal_main.py" "\$@"
 WRAPPER_EOF
 chmod +x "$wrapper"
 
-printf 'PromptPal installed:\n'
-printf '  binary:  %s\n' "$wrapper"
-printf '  data:    %s\n' "$PROMPTPAL_HOME"
-printf '  lib:     %s\n' "$promptpal_lib"
+# L12 (issue #30): single multi-arg printf for consistency with the
+# bin/promptpal launcher and uninstall.sh idioms — same shape across
+# the three scripts means less drift risk on a future edit.
+printf '%s\n' \
+    'PromptPal installed:' \
+    "  binary:  $wrapper" \
+    "  data:    $PROMPTPAL_HOME" \
+    "  lib:     $promptpal_lib"
 
 # ---------------------------------------------------------------------------
 # PATH check (warn, never fail — AC #3 "warns if not on PATH")

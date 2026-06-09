@@ -278,12 +278,48 @@ def test_installer_url_matches_version() -> None:
     assert f"-{WINGET_PACKAGE_VERSION}.zip" in installer_url
 
 
-def test_installer_sha256_is_placeholder_or_valid_hex() -> None:
-    """SHA must be 64 hex chars; zero-hash placeholder fails publish fast."""
+PRE_RELEASE_SHA256_PLACEHOLDER: str = "X" * 64
+"""H9 (issue #30): structurally-invalid 64-char sentinel for the unreleased
+manifest. Fails the winget ``^[A-Fa-f0-9]{64}$`` pattern so
+``winget validate`` rejects it locally — unlike the pre-fix zero-hash,
+which was syntactically valid hex and only failed at install time."""
+
+
+def test_installer_sha256_is_release_placeholder_or_valid_hex() -> None:
+    """SHA must be either the H9 release placeholder (rejected by
+    ``winget validate``) or a valid 64-hex string (post-release).
+
+    The pre-fix test required valid 64-hex unconditionally, which the
+    zero-hash placeholder passed — defeating the "fail fast on
+    accidental publish" intent. Now the test pins that an unreleased
+    manifest carries the structurally-invalid sentinel, and a real
+    release carries the actual hex, but never anything else.
+    """
     text = INSTALLER_MANIFEST.read_text(encoding="utf-8")
     sha = _yaml_scalar(text, "InstallerSha256")
     assert sha is not None
-    assert re.fullmatch(r"[0-9A-Fa-f]{64}", sha), f"InstallerSha256 not 64-hex: {sha!r}"
+    if sha == PRE_RELEASE_SHA256_PLACEHOLDER:
+        return  # unreleased manifest — winget validate will reject it
+    assert re.fullmatch(r"[0-9A-Fa-f]{64}", sha), (
+        f"InstallerSha256 must be the release placeholder ({PRE_RELEASE_SHA256_PLACEHOLDER!r}) "
+        f"or a valid 64-hex string; got {sha!r}"
+    )
+
+
+def test_installer_manifest_declares_both_launcher_files() -> None:
+    """H10 (issue #30): NestedInstallerFiles must declare both
+    ``promptpal.cmd`` (the PortableCommandAlias entry point) and
+    ``promptpal.ps1`` (which the .cmd execs at runtime).
+
+    Pre-fix code listed only the .cmd. If the release zip ships only
+    the .cmd by mistake, every invocation hits ``FileNotFoundException``
+    on ``promptpal.ps1`` — winget would not catch this at install time
+    because the .ps1 wasn't declared. Declaring both files makes the
+    extraction-time check enforce the contract.
+    """
+    text = INSTALLER_MANIFEST.read_text(encoding="utf-8")
+    assert "RelativeFilePath: promptpal.cmd" in text
+    assert "RelativeFilePath: promptpal.ps1" in text
 
 
 # ---------------------------------------------------------------------------
