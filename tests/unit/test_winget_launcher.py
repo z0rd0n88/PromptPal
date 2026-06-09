@@ -123,6 +123,37 @@ def test_cmd_delegates_to_ps1() -> None:
     assert "%*" in body, "must forward all args"
 
 
+def test_cmd_forwards_args_immediately_after_ps1_path() -> None:
+    """L13-adjacent pin (issue #30): ``%*`` must be the last token after
+    the ``-File "...promptpal.ps1"`` path, with no intervening flags or
+    separators that could prevent cmd's quote-preserving expansion from
+    reaching PowerShell as positional script args.
+
+    Cmd's ``%*`` preserves quoted args in the common case
+    (``promptpal "hello world"`` → ``%*`` = ``"hello world"`` →
+    PowerShell's ``-File`` arg parser sees one positional arg). A future
+    refactor that injects flags between ``-File`` and ``%*`` (e.g.
+    ``-Command``, ``-NoExit``, a hand-rolled separator) would break this
+    invariant silently. This test fences that invariant at the string
+    level — a true round-trip test through real cmd + powershell + wsl
+    requires a Windows host and is out of scope for the Linux/WSL test
+    suite (which marks ``tests/integration/test_winget_launcher.py``
+    with the same skip-off-Windows pattern).
+    """
+    body = PROMPTPAL_CMD_PATH.read_text(encoding="utf-8")
+    # The line must end with `"...promptpal.ps1" %*\n` (modulo trailing
+    # whitespace) so cmd's %* expands directly into PowerShell's
+    # positional script-args slot.
+    pattern = re.compile(
+        r'-File\s+"[^"]*promptpal\.ps1"\s+%\*\s*$',
+        re.MULTILINE,
+    )
+    assert pattern.search(body), (
+        "promptpal.cmd must forward args via `-File \"...promptpal.ps1\" %*` "
+        "with no tokens between the script path and %*"
+    )
+
+
 def test_ps1_uses_wsl_list_quiet_for_detection() -> None:
     body = PROMPTPAL_PS1_PATH.read_text(encoding="utf-8")
     assert "wsl.exe --list --quiet" in body

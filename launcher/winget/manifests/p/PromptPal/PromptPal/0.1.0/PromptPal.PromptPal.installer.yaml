@@ -19,9 +19,12 @@
 #
 # NestedInstallerFiles declares BOTH promptpal.cmd (the alias entry
 # point) and promptpal.ps1 (which the .cmd execs at runtime) per H10
-# — if the release zip ships only the .cmd, the .ps1 reference in
-# NestedInstallerFiles fails extraction-time validation rather than
-# producing a FileNotFoundException on every later invocation.
+# — declaring the .ps1 makes the manifest internally consistent with
+# the actual launcher topology. winget's extraction behavior for a
+# manifest that declares a file missing from the zip is not formally
+# documented; the safer fix is to keep the manifest honest about every
+# launcher file so a release-workflow audit (and any future winget
+# tooling that does verify per-file presence) can flag the mismatch.
 
 PackageIdentifier: PromptPal.PromptPal
 PackageVersion: 0.1.0
