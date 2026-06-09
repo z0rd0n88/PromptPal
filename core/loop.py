@@ -140,10 +140,24 @@ class LoopOutcome:
 
 
 ChoiceReader = Callable[[], str]
-"""Signature: ``() -> str``. Returns one line of raw input from the user."""
+"""Signature: ``() -> str``. Returns one line of raw input from the user.
+
+EOF contract (H8, issue #30): the default reader uses ``readline()`` which
+returns ``""`` on EOF. Injectable readers backed by ``input()`` may raise
+:class:`EOFError` instead; the loop treats either form as "EOF — exit
+cleanly via the DISCARDED branch". Returning ``""`` and raising
+``EOFError`` are interchangeable from the loop's point of view; raising
+any other exception still propagates to the caller.
+"""
 
 FeedbackReader = Callable[[], str]
-"""Signature: ``() -> str``. Returns one line of iterate feedback (no banner)."""
+"""Signature: ``() -> str``. Returns one line of iterate feedback (no banner).
+
+EOF contract (H8, issue #30): same as :data:`ChoiceReader` — ``""`` and
+``EOFError`` are interchangeable; both are treated as empty feedback,
+which skips the backend call, prints the empty-feedback notice, and
+re-presents the choice line.
+"""
 
 Display = Callable[[str, str], None]
 """Signature: ``(original, improved) -> None``. Renders the diff/full prompt."""
@@ -291,7 +305,14 @@ def run_refinement_loop(
         display_fn(original_prompt, improved)
 
     while True:
-        raw = choice_fn()
+        # H8 (issue #30): default _default_choice_reader uses readline()
+        # which returns "" on EOF, but an input()-backed injected reader
+        # raises EOFError instead. Treat both as "EOF — exit cleanly"
+        # so the loop never infinite-loops on a closed input stream.
+        try:
+            raw = choice_fn()
+        except EOFError:
+            raw = ""
         if raw == "":
             # EOF on stdin — bail out cleanly as a discard so the loop
             # cannot infinite-loop on a closed input stream.
@@ -327,10 +348,24 @@ def run_refinement_loop(
             )
 
         if action == ACTION_ITERATE:
-            feedback = feedback_fn()
+            # H8 (issue #30): same EOFError tolerance as choice_fn — an
+            # input()-backed feedback reader raises EOFError, which we
+            # treat as empty feedback (skip + re-present, not crash).
+            try:
+                feedback = feedback_fn()
+            except EOFError:
+                feedback = ""
             if not feedback.strip():
                 # Empty feedback — skip the backend call so we don't
                 # burn tokens on whitespace. Re-present the choice line.
+                # M17 (issue #30): tell the user why nothing happened so
+                # the silent re-presentation doesn't look like a hang.
+                # ASCII hyphen (not em-dash) so the string round-trips
+                # cleanly on cp1252 / LANG=C terminals.
+                print(
+                    "No feedback provided - staying on the same prompt.",
+                    file=stderr_in,
+                )
                 continue
             improved, turn = _iterate(
                 backend=backend,
@@ -375,16 +410,39 @@ def _iterate(
     messages: list[dict[str, str]],
     feedback: str,
 ) -> tuple[str, LoopTurn]:
-    """Append a user feedback turn, call the backend, append the response.
+    """Call the backend with a candidate message log; commit on success.
 
-    Mutates ``messages`` in place (the loop holds the only reference)
-    and returns the new improved text plus a :class:`LoopTurn` carrying
-    the metadata the caller will fold into the session.
+    On success, appends the user feedback turn and the assistant response
+    turn to ``messages`` (in that order), and returns the new improved
+    text plus a :class:`LoopTurn` carrying metadata for the session
+    folder. On failure (``backend.complete`` raises), ``messages`` is
+    left byte-identical to the input — H7 (issue #30) commit-after-
+    success invariant.
+
+    Pre-fix code appended the user turn FIRST, so a raise from the
+    backend (network blip, auth failure, timeout) left a dangling user
+    turn — the next ``_iterate`` call appended another user turn on
+    top, producing two consecutive user turns that the production
+    claude-cli parser misbehaves on. Building a candidate list before
+    the call makes the "messages is the committed log" invariant
+    structural rather than convention.
+
+    Two distinct copies are made:
+
+    1. ``list(messages)`` (shallow copy on the outer list) — isolates
+       the candidate so the pre-call append never lands in the caller's
+       ``messages`` list. This is the H7 commit-after-success guard.
+    2. ``[dict(m) for m in candidate]`` (per-element dict copy on the
+       wire payload) — protects against a backend that mutates the
+       dicts it receives. This is the pre-existing wire-payload guard
+       and is preserved verbatim.
     """
+    candidate = list(messages)
+    candidate.append({"role": "user", "content": feedback})
+    response = backend.complete(system, [dict(m) for m in candidate])
+    # Backend call succeeded — only now commit the user turn and the
+    # matching assistant turn to the real messages list.
     messages.append({"role": "user", "content": feedback})
-    # Send a defensive copy so a backend that mutates its argument
-    # cannot scramble our message log.
-    response = backend.complete(system, [dict(m) for m in messages])
     messages.append({"role": "assistant", "content": response.text})
     turn = LoopTurn(
         backend=backend.name,

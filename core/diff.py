@@ -46,21 +46,29 @@ def format_diff(
     *,
     fromfile: str = DEFAULT_FROMFILE,
     tofile: str = DEFAULT_TOFILE,
-) -> str:
+) -> str | None:
     """Return a unified diff between ``original`` and ``improved``.
 
     Uses :func:`difflib.unified_diff` with ``lineterm=""`` so the joined
-    string is newline-terminated cleanly without double newlines. When
-    the two inputs are identical, the result is the empty string (the
-    caller may still choose to print a header).
+    string is newline-terminated cleanly without double newlines.
+
+    Returns ``None`` (M16, issue #30) when the two inputs are identical
+    — callers must explicitly check ``is not None`` rather than relying
+    on truthiness, which makes accidental ``print(format_diff(a, b))``
+    of an empty diff (and a stray blank line) a type error instead of
+    silent UX cruft.
     """
     original_lines = original.splitlines()
     improved_lines = improved.splitlines()
-    diff_lines = difflib.unified_diff(
-        original_lines,
-        improved_lines,
-        fromfile=fromfile,
-        tofile=tofile,
-        lineterm="",
+    diff_lines = list(
+        difflib.unified_diff(
+            original_lines,
+            improved_lines,
+            fromfile=fromfile,
+            tofile=tofile,
+            lineterm="",
+        )
     )
+    if not diff_lines:
+        return None
     return "\n".join(diff_lines)

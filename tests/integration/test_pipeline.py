@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import io
 
+import pytest
+
 from core.backend import Backend, BackendResponse, Message
 from core.loop import (
     CHOICE_PROMPT,
@@ -296,6 +298,129 @@ def test_iterate_with_empty_feedback_skips_backend_call():
     assert backend.calls == []
     assert outcome.final_prompt == "improved v1"
     assert outcome.new_turns == ()
+
+
+def test_iterate_empty_feedback_prints_notice_to_stderr():
+    """M17 (issue #30): an empty feedback (Enter at the iterate prompt)
+    used to silently re-present the choice line. A one-line stderr
+    notice now tells the user why nothing happened."""
+    backend = FakeBackend(responses=[])
+    stderr = io.StringIO()
+    choice_reader = _make_choice_reader(["i", "a"])
+    feedback_reader = _make_feedback_reader(["   \n"])  # whitespace only
+
+    run_refinement_loop(
+        backend=backend,
+        system="sys",
+        initial_messages=_initial_messages(),
+        initial_improved="improved v1",
+        original_prompt="user prompt",
+        choice_reader=choice_reader,
+        feedback_reader=feedback_reader,
+        stderr=stderr,
+    )
+    err = stderr.getvalue()
+    assert "no feedback" in err.lower() or "empty" in err.lower(), (
+        f"expected empty-feedback notice on stderr; got: {err!r}"
+    )
+    # Must be ASCII-safe — em-dash would crash on cp1252 / LANG=C terminals.
+    assert "—" not in err, (
+        "M17 notice must use ASCII hyphen, not em-dash, for terminal safety"
+    )
+
+
+def test_iterate_backend_failure_does_not_corrupt_messages():
+    """H7 (issue #30): when ``backend.complete`` raises mid-iterate, the
+    messages list must NOT carry a dangling user turn.
+
+    Pre-fix code appended the user turn FIRST, then called the backend.
+    On a raise, the user turn stayed in the list with no matching
+    assistant turn — the next iterate appended ANOTHER user turn, giving
+    two consecutive user turns that the production claude-cli parser
+    misbehaves on. The fix builds a candidate, calls the backend with
+    the candidate, only commits on success.
+    """
+    from core.loop import _iterate
+
+    class _BoomBackend(Backend):
+        @property
+        def name(self) -> str:
+            return "boom"
+
+        def complete(
+            self, system: str, messages: list[Message], stream: bool = False
+        ) -> BackendResponse:
+            raise RuntimeError("backend boom")
+
+        def check_auth(self) -> bool:
+            return False
+
+    messages: list[Message] = [
+        {"role": "user", "content": "orig"},
+        {"role": "assistant", "content": "improved v1"},
+    ]
+    snapshot = [dict(m) for m in messages]
+    with pytest.raises(RuntimeError, match="backend boom"):
+        _iterate(
+            backend=_BoomBackend(),
+            system="sys",
+            messages=messages,
+            feedback="make it shorter",
+        )
+    # Messages must be byte-identical to the snapshot — no dangling
+    # user turn left behind.
+    assert messages == snapshot, (
+        "_iterate must not commit the user turn when backend.complete fails"
+    )
+
+
+def test_loop_choice_reader_eoferror_treated_as_eof():
+    """H8 (issue #30): a caller-injected choice_reader backed by
+    ``input()`` raises ``EOFError`` on closed stdin. The loop's
+    ``readline()``-based default returns ``""`` and exits via the
+    EOF branch; ``input()``-based readers must reach the same exit
+    instead of crashing the loop.
+    """
+
+    def eof_choice_reader() -> str:
+        raise EOFError()
+
+    outcome = run_refinement_loop(
+        backend=FakeBackend(responses=[]),
+        system="sys",
+        initial_messages=_initial_messages(),
+        initial_improved="improved v1",
+        original_prompt="user prompt",
+        choice_reader=eof_choice_reader,
+    )
+    # Same exit as raw == "": discard.
+    assert outcome.status == STATUS_DISCARDED
+    assert outcome.final_prompt == "improved v1"
+
+
+def test_loop_feedback_reader_eoferror_treated_as_eof():
+    """H8: same protection for feedback_reader — an EOFError must be
+    treated as empty feedback (skip iterate + re-present), not crash."""
+    backend = FakeBackend(responses=[])
+    stderr = io.StringIO()
+
+    def eof_feedback_reader() -> str:
+        raise EOFError()
+
+    outcome = run_refinement_loop(
+        backend=backend,
+        system="sys",
+        initial_messages=_initial_messages(),
+        initial_improved="improved v1",
+        original_prompt="user prompt",
+        choice_reader=_make_choice_reader(["i", "a"]),
+        feedback_reader=eof_feedback_reader,
+        stderr=stderr,
+    )
+    # Same as a whitespace-only feedback: backend not called, accept exit
+    # via the next choice.
+    assert backend.calls == []
+    assert outcome.final_prompt == "improved v1"
 
 
 def test_iterate_messages_grow_monotonically():

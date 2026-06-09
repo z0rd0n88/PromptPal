@@ -1191,10 +1191,16 @@ def _run_pipeline(
 
     if config.show_diff and options.output == OUTPUT_PLAIN:
         if should_show_diff(first_response.text):
-            print(
-                format_diff(original_prompt, first_response.text),
-                file=stderr,
-            )
+            diff_text = format_diff(original_prompt, first_response.text)
+            # M16 (issue #30): format_diff returns None for an identical
+            # original/improved pair. Pre-fix code emitted a stray blank
+            # line; printing the full response text instead would surprise
+            # piped consumers of stderr. A brief "(no changes)" sentinel
+            # gives the user a real signal without changing the volume.
+            if diff_text is not None:
+                print(diff_text, file=stderr)
+            else:
+                print("(no changes)", file=stderr)
         else:
             print(first_response.text, file=stderr)
 
