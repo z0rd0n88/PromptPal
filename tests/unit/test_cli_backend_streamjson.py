@@ -556,6 +556,15 @@ def test_summarize_stdout_failure_empty_and_garbage_return_empty() -> None:
     assert _summarize_stdout_failure(b"not json\n{broken\n") == ""
 
 
+def test_summarize_stdout_failure_requires_system_type_for_api_retry() -> None:
+    """P1-FIX-28-05: ``subtype: "api_retry"`` is only a retry event when
+    paired with ``type: "system"``. Other types reusing the subtype must
+    not be counted as retries.
+    """
+    bogus = {"type": "user", "subtype": "api_retry", "attempt": 1}
+    assert _summarize_stdout_failure(_ndjson(bogus)) == ""
+
+
 def test_is_auth_failure_helper() -> None:
     assert _is_auth_failure("PLEASE auth login") is True
     assert _is_auth_failure("Authentication required") is True

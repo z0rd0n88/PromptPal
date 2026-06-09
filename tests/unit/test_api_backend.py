@@ -443,7 +443,10 @@ def _stream_events() -> list[dict]:
 def test_stream_accumulates_text_and_tokens(
     make_backend, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    """P1-FIX-28-01 / P1-PIPE-09: stream=True assembles text+tokens, but
+    no longer writes deltas to stdout (pipe-safety reserves stdout for
+    the final improved prompt only).
+    """
     backend, transport = make_backend(
         [_HttpResponse(status=200, headers={}, stream_iter=iter(_stream_events()))]
     )
@@ -453,26 +456,31 @@ def test_stream_accumulates_text_and_tokens(
     assert result.output_tokens == 47
     assert transport.calls[0]["stream"] is True
     assert transport.calls[0]["body"]["stream"] is True
-    # streamed deltas reach stdout
+    # P1-FIX-28-01: streamed deltas MUST NOT reach stdout
     captured = capsys.readouterr()
-    assert "Hello world" in captured.out
+    assert captured.out == ""
 
 
-def test_stream_disabled_when_stdout_not_a_tty(
+def test_stream_honored_when_stdout_not_a_tty(
     make_backend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """stream=True + non-TTY → falls back to non-streaming request."""
+    """P1-FIX-28-02: stream=True is honored regardless of TTY state.
+
+    Replaces the previous TTY-downgrade behavior — since the stream path
+    no longer emits user-visible output, the isatty() gate is moot and
+    ``stream`` now controls only the transport (SSE vs JSON).
+    """
     monkeypatch.setattr("sys.stdout.isatty", lambda: False)
-    backend, transport = make_backend([_http(200, _ok_payload())])
-    backend.complete("", [{"role": "user", "content": "hi"}], stream=True)
-    assert transport.calls[0]["stream"] is False
-    assert "stream" not in transport.calls[0]["body"]
+    backend, transport = make_backend(
+        [_HttpResponse(status=200, headers={}, stream_iter=iter(_stream_events()))]
+    )
+    result = backend.complete("", [{"role": "user", "content": "hi"}], stream=True)
+    assert result.text == "Hello world"
+    assert transport.calls[0]["stream"] is True
+    assert transport.calls[0]["body"]["stream"] is True
 
 
-def test_stream_disabled_when_stream_false_even_on_tty(
-    make_backend, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+def test_stream_disabled_when_stream_false(make_backend) -> None:
     backend, transport = make_backend([_http(200, _ok_payload())])
     backend.complete("", [{"role": "user", "content": "hi"}], stream=False)
     assert transport.calls[0]["stream"] is False
@@ -667,3 +675,57 @@ def test_base_url_trailing_slash_stripped(make_backend, sleeps: list[float]) -> 
     )
     backend.complete("", [{"role": "user", "content": "hi"}])
     assert transport.calls[0]["url"] == f"https://api.example.com{MESSAGES_PATH}"
+
+
+# ---------------------------------------------------------------------------
+# Issue #28 follow-up fixes (P1-FIX-28-NN)
+# ---------------------------------------------------------------------------
+
+
+def test_stream_does_not_write_to_stdout_when_piped(
+    make_backend, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P1-FIX-28-01 / P1-PIPE-09: with piped stdout, streaming must not
+    leak deltas to stdout (reserved for the final improved prompt).
+    """
+    monkeypatch.setattr("sys.stdout.isatty", lambda: False)
+    backend, _transport = make_backend(
+        [_HttpResponse(status=200, headers={}, stream_iter=iter(_stream_events()))]
+    )
+    result = backend.complete("", [{"role": "user", "content": "hi"}], stream=True)
+    assert result.text == "Hello world"
+    captured = capsys.readouterr()
+    assert captured.out == ""
+
+
+def test_parse_response_body_null_content_returns_empty(make_backend) -> None:
+    """P1-FIX-28-03: ``{"content": null}`` must not crash (mirrors the
+    defensive ``or []`` pattern in cli_backend._extract_text_from_event).
+    """
+    backend, _transport = make_backend([])
+    body = json.dumps({"content": None, "usage": {"input_tokens": 1, "output_tokens": 2}}).encode("utf-8")
+    result = backend._parse_response_body(body)
+    assert isinstance(result, BackendResponse)
+    assert result.text == ""
+    assert result.input_tokens == 1
+    assert result.output_tokens == 2
+
+
+def test_parse_response_body_null_usage_returns_none_tokens(make_backend) -> None:
+    """P1-FIX-28-03: ``{"usage": null}`` already handled — pin it."""
+    backend, _transport = make_backend([])
+    body = json.dumps({"content": [{"type": "text", "text": "x"}], "usage": None}).encode("utf-8")
+    result = backend._parse_response_body(body)
+    assert result.text == "x"
+    assert result.input_tokens is None
+    assert result.output_tokens is None
+
+
+def test_server_error_backoff_length_invariant() -> None:
+    """P1-FIX-28-04: backoff tuple must cover all server-error retries.
+
+    The retry loop indexes ``SERVER_ERROR_BACKOFF_SECONDS[server_retries]``
+    up to ``server_retries == MAX_SERVER_ERROR_RETRIES - 1``. The
+    module-level assert catches a mismatch at import time.
+    """
+    assert len(api_mod.SERVER_ERROR_BACKOFF_SECONDS) >= api_mod.MAX_SERVER_ERROR_RETRIES

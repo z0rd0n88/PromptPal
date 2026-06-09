@@ -160,5 +160,5 @@ PromptPal/
 └── uninstall.sh  — bash uninstaller that removes `~/.local/bin/promptpal` and optionally purges the `~/.promptpal/` data directory.
 ```
 
-_Generated 2026-06-07 17:04 UTC · 92 files · 31 directories._
+_Generated 2026-06-09 07:44 UTC · 92 files · 31 directories._
 <!-- ARCH:TREE:END -->

@@ -25,7 +25,14 @@ class BackendResponse:
 
 
 class Backend(ABC):
-    """Abstract base class for prompt-improvement backends (SPEC §6)."""
+    """Abstract base class for prompt-improvement backends (SPEC §6).
+
+    Convention: concrete subclasses (and related exception classes in the
+    same backend module) MAY define a ``MESSAGE: ClassVar[str]`` class
+    attribute carrying a canonical user-facing error string — see e.g.
+    ``ApiKeyMissingError.MESSAGE`` and ``NoBackendError.MESSAGE``. This
+    is a documentation convention only; it is not enforced by the ABC.
+    """
 
     @property
     @abstractmethod
