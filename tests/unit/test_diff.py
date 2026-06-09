@@ -111,10 +111,22 @@ def test_should_show_diff_many_lines_is_true():
 # ---------------------------------------------------------------------------
 
 
-def test_format_diff_identical_inputs_returns_empty_string():
-    """unified_diff yields nothing when the two sequences are equal."""
+def test_format_diff_identical_inputs_returns_none():
+    """M16 (issue #30): when there's nothing to diff, ``format_diff``
+    returns ``None`` rather than an empty string. Empty-string callers
+    couldn't easily distinguish "no diff" from "string-empty diff body"
+    and a future caller doing ``print(format_diff(a, b))`` blindly would
+    emit a stray blank line. ``None`` forces an explicit check."""
     text = "alpha\nbeta\ngamma\ndelta"
-    assert format_diff(text, text) == ""
+    assert format_diff(text, text) is None
+
+
+def test_format_diff_different_inputs_returns_str_not_none():
+    """M16 pin: a real diff still returns a string. Tests the happy path
+    of the new ``str | None`` return type."""
+    diff = format_diff("alpha\nbeta", "alpha\ngamma")
+    assert isinstance(diff, str)
+    assert diff != ""
 
 
 def test_format_diff_contains_unified_diff_markers():
@@ -122,6 +134,7 @@ def test_format_diff_contains_unified_diff_markers():
     original = "alpha\nbeta\ngamma\ndelta"
     improved = "alpha\nBETA\ngamma\ndelta"
     diff = format_diff(original, improved)
+    assert diff is not None
     assert diff.startswith("--- original")
     assert "\n+++ improved" in diff
     assert "@@" in diff
@@ -131,6 +144,7 @@ def test_format_diff_marks_removed_and_added_lines():
     original = "keep\nremove\nkeep"
     improved = "keep\nadded\nkeep"
     diff = format_diff(original, improved)
+    assert diff is not None
     assert "-remove" in diff
     assert "+added" in diff
 
@@ -142,6 +156,7 @@ def test_format_diff_custom_filenames_are_used():
         fromfile="prompt_v1.md",
         tofile="prompt_v2.md",
     )
+    assert diff is not None
     assert "--- prompt_v1.md" in diff
     assert "+++ prompt_v2.md" in diff
 
@@ -151,12 +166,14 @@ def test_format_diff_no_blank_double_newlines():
     original = "alpha\nbeta\ngamma\ndelta"
     improved = "alpha\nbeta\nGAMMA\ndelta"
     diff = format_diff(original, improved)
+    assert diff is not None
     assert "\n\n" not in diff
 
 
 def test_format_diff_empty_original_against_text():
     """Inserting content into an empty original is a pure-add diff."""
     diff = format_diff("", "added\nlines")
+    assert diff is not None
     assert "+added" in diff
     assert "+lines" in diff
 
@@ -164,6 +181,7 @@ def test_format_diff_empty_original_against_text():
 def test_format_diff_text_against_empty_improved():
     """Erasing everything is a pure-remove diff."""
     diff = format_diff("gone\nlines", "")
+    assert diff is not None
     assert "-gone" in diff
     assert "-lines" in diff
 

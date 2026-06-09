@@ -1191,10 +1191,15 @@ def _run_pipeline(
 
     if config.show_diff and options.output == OUTPUT_PLAIN:
         if should_show_diff(first_response.text):
-            print(
-                format_diff(original_prompt, first_response.text),
-                file=stderr,
-            )
+            diff_text = format_diff(original_prompt, first_response.text)
+            # M16 (issue #30): format_diff returns None for an identical
+            # original/improved pair. The legacy emptiness-check was
+            # implicit; now the None return forces an explicit branch so
+            # we never `print()` a stray blank line.
+            if diff_text is not None:
+                print(diff_text, file=stderr)
+            else:
+                print(first_response.text, file=stderr)
         else:
             print(first_response.text, file=stderr)
 

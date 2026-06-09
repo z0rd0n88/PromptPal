@@ -291,7 +291,14 @@ def run_refinement_loop(
         display_fn(original_prompt, improved)
 
     while True:
-        raw = choice_fn()
+        # H8 (issue #30): default _default_choice_reader uses readline()
+        # which returns "" on EOF, but an input()-backed injected reader
+        # raises EOFError instead. Treat both as "EOF — exit cleanly"
+        # so the loop never infinite-loops on a closed input stream.
+        try:
+            raw = choice_fn()
+        except EOFError:
+            raw = ""
         if raw == "":
             # EOF on stdin — bail out cleanly as a discard so the loop
             # cannot infinite-loop on a closed input stream.
@@ -327,10 +334,22 @@ def run_refinement_loop(
             )
 
         if action == ACTION_ITERATE:
-            feedback = feedback_fn()
+            # H8 (issue #30): same EOFError tolerance as choice_fn — an
+            # input()-backed feedback reader raises EOFError, which we
+            # treat as empty feedback (skip + re-present, not crash).
+            try:
+                feedback = feedback_fn()
+            except EOFError:
+                feedback = ""
             if not feedback.strip():
                 # Empty feedback — skip the backend call so we don't
                 # burn tokens on whitespace. Re-present the choice line.
+                # M17 (issue #30): tell the user why nothing happened so
+                # the silent re-presentation doesn't look like a hang.
+                print(
+                    "Feedback was empty — iteration skipped.",
+                    file=stderr_in,
+                )
                 continue
             improved, turn = _iterate(
                 backend=backend,
@@ -380,11 +399,24 @@ def _iterate(
     Mutates ``messages`` in place (the loop holds the only reference)
     and returns the new improved text plus a :class:`LoopTurn` carrying
     the metadata the caller will fold into the session.
+
+    H7 (issue #30): commits the user turn to ``messages`` **only after**
+    ``backend.complete`` returns successfully. Pre-fix code appended the
+    user turn first, so a raise from the backend (network blip, auth
+    failure, timeout) left a dangling user turn — the next ``_iterate``
+    call appended another user turn on top, producing two consecutive
+    user turns that the production claude-cli parser misbehaves on.
+
+    The candidate is the existing ``messages`` plus the new user turn;
+    the defensive ``[dict(m) for m in candidate]`` copy still protects
+    against a backend that mutates its argument.
     """
+    candidate = list(messages)
+    candidate.append({"role": "user", "content": feedback})
+    response = backend.complete(system, [dict(m) for m in candidate])
+    # Backend call succeeded — only now commit the user turn and the
+    # matching assistant turn to the real messages list.
     messages.append({"role": "user", "content": feedback})
-    # Send a defensive copy so a backend that mutates its argument
-    # cannot scramble our message log.
-    response = backend.complete(system, [dict(m) for m in messages])
     messages.append({"role": "assistant", "content": response.text})
     turn = LoopTurn(
         backend=backend.name,
