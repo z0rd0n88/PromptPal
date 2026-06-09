@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import TextIO
 
 from core.api_backend import ApiKeyMissingError
-from core.backend import Backend, Message, NoBackendError
+from core.backend import Backend, BackendResponse, Message, NoBackendError
 from core.cli_backend import CliNotFoundError
 from core.config import (
     Config,
@@ -995,6 +995,132 @@ def _try_write_session(
 # ---------------------------------------------------------------------------
 
 
+def _run_quiet_pipeline(
+    *,
+    options: CLIOptions,
+    config: Config,
+    history_dir: Path,
+    usage_log_path: Path,
+    backend: Backend,
+    backend_short: str,
+    system: str,
+    initial_messages: list[Message],
+    first_response: BackendResponse,
+    iterations: int,
+    original_prompt: str,
+    session: Session,
+    stdout: TextIO,
+    stderr: TextIO,
+    copy_fn: Callable[[str], bool],
+    clock: Callable[[], str] | None,
+) -> int:
+    """``--quiet`` execution path (M6, issue #30).
+
+    Auto-accepts after the first turn (AC #3). Honors ``--iterations N``
+    by running N synthesized iterations against the same backend and
+    taking the last assistant response. No diff, no choice line, no
+    stderr chatter from the loop.
+
+    Extracted from ``_run_pipeline`` in slice 5 of the issue-#30
+    review-driven refactor so both execution branches stay readable.
+    The shared header (read prompt, first turn, build session, persist
+    backend preference, incremental write) lives in ``_run_pipeline``
+    and is run before this helper is called.
+
+    M4 (issue #30): writes one ``append_usage_entry`` row per
+    synthesized iteration, mirroring the interactive branch. The first
+    turn's usage row was already written by ``_run_pipeline`` before
+    the fork.
+    """
+    improved = first_response.text
+    messages = list(initial_messages)
+    new_turns_count = 0
+    try:
+        for _ in range(max(0, iterations)):
+            messages.append(
+                {"role": "user", "content": SYNTHESIZED_FEEDBACK}
+            )
+            response = backend.complete(
+                system, [dict(m) for m in messages]
+            )
+            messages.append(
+                {"role": "assistant", "content": response.text}
+            )
+            improved = response.text
+            session = append_turn(
+                session,
+                role="user",
+                content=SYNTHESIZED_FEEDBACK,
+                backend=backend_short,
+                input_tokens=None,
+                output_tokens=None,
+                clock=clock,
+            )
+            session = append_turn(
+                session,
+                role="assistant",
+                content=response.text,
+                backend=backend_short,
+                input_tokens=response.input_tokens,
+                output_tokens=response.output_tokens,
+                clock=clock,
+            )
+            new_turns_count += 1
+            # M4: per-iteration usage entry — parity with the interactive
+            # branch. ``turn_index`` starts at 1 because the first turn
+            # (index 0) was logged in ``_run_pipeline`` before the fork.
+            if config.history_enabled and not options.no_history:
+                try:
+                    append_usage_entry(
+                        usage_log_path,
+                        session_id=session.session_id,
+                        turn_index=new_turns_count,
+                        backend=backend_short,
+                        model=config.default_model,
+                        input_tokens=response.input_tokens,
+                        output_tokens=response.output_tokens,
+                        clock=clock,
+                    )
+                except OSError:
+                    # Usage log writes are non-fatal (P1-HIST-08-adjacent).
+                    pass
+    except Exception as e:  # noqa: BLE001
+        print(f"Error: {e}", file=stderr)
+        return EXIT_FAILURE
+
+    session = finalize_session(
+        session,
+        status=STATUS_ACCEPTED,
+        final_prompt=improved,
+        clock=clock,
+    )
+    if config.history_enabled and not options.no_history:
+        _try_write_session(session, history_dir, stderr=stderr)
+        try:
+            enforce_max_entries(history_dir, config.max_history_entries)
+        except OSError:
+            pass
+
+    if options.copy or config.auto_copy:
+        # No stderr chatter in --quiet mode; copy_fn's success/failure
+        # is intentionally not surfaced (AC #3 — quiet means quiet).
+        copy_fn(improved)
+
+    print(
+        format_output(
+            output=options.output,
+            original=original_prompt,
+            improved=improved,
+            turns=1 + new_turns_count,
+            session_id=session.session_id,
+            backend_name=backend_short,
+            model=config.default_model,
+        ),
+        file=stdout,
+    )
+    return EXIT_OK
+
+
 def _run_pipeline(
     *,
     options: CLIOptions,
@@ -1046,13 +1172,22 @@ def _run_pipeline(
 
     # Persist the explicit backend choice now that the first turn succeeded.
     if options.backend in (BACKEND_CLI, BACKEND_API):
+        # M2 (issue #30): persist_backend_preference internally calls
+        # load_config which can raise ConfigCorruptError. Both failures
+        # are non-fatal here (the run already produced a response), but
+        # they merit distinct user-facing messages — OSError is transient
+        # I/O, ConfigCorruptError needs user intervention.
         try:
             persist_backend_preference(config_path, options.backend)  # type: ignore[arg-type]
         except OSError:
-            # Config write failures are non-fatal here — the run already
-            # produced a response. Surface a warning to stderr.
             print(
-                "Warning: could not persist preferred backend.",
+                "Warning: could not persist preferred backend (I/O failure).",
+                file=stderr,
+            )
+        except ConfigCorruptError:
+            print(
+                f"Warning: could not persist preferred backend — "
+                f"{config_path} is corrupt; edit or delete it to recover.",
                 file=stderr,
             )
 
@@ -1111,81 +1246,24 @@ def _run_pipeline(
     iterations = options.iterations if options.iterations is not None else 0
 
     if options.quiet:
-        # AC #3: --quiet auto-accepts after the first turn. We still
-        # honor --iterations N by running N synthesized iterations and
-        # taking the last assistant response. No diff, no choice line,
-        # no stderr chatter from the loop.
-        improved = first_response.text
-        messages = list(initial_messages)
-        new_turns_count = 0
-        try:
-            for _ in range(max(0, iterations)):
-                messages.append(
-                    {"role": "user", "content": SYNTHESIZED_FEEDBACK}
-                )
-                response = backend.complete(
-                    system, [dict(m) for m in messages]
-                )
-                messages.append(
-                    {"role": "assistant", "content": response.text}
-                )
-                improved = response.text
-                session = append_turn(
-                    session,
-                    role="user",
-                    content=SYNTHESIZED_FEEDBACK,
-                    backend=backend_short,
-                    input_tokens=None,
-                    output_tokens=None,
-                    clock=clock,
-                )
-                session = append_turn(
-                    session,
-                    role="assistant",
-                    content=response.text,
-                    backend=backend_short,
-                    input_tokens=response.input_tokens,
-                    output_tokens=response.output_tokens,
-                    clock=clock,
-                )
-                new_turns_count += 1
-        except Exception as e:  # noqa: BLE001
-            print(f"Error: {e}", file=stderr)
-            return EXIT_FAILURE
-
-        session = finalize_session(
-            session,
-            status=STATUS_ACCEPTED,
-            final_prompt=improved,
+        return _run_quiet_pipeline(
+            options=options,
+            config=config,
+            history_dir=history_dir,
+            usage_log_path=usage_log_path,
+            backend=backend,
+            backend_short=backend_short,
+            system=system,
+            initial_messages=initial_messages,
+            first_response=first_response,
+            iterations=iterations,
+            original_prompt=original_prompt,
+            session=session,
+            stdout=stdout,
+            stderr=stderr,
+            copy_fn=copy_fn,
             clock=clock,
         )
-        if config.history_enabled and not options.no_history:
-            _try_write_session(session, history_dir, stderr=stderr)
-            try:
-                enforce_max_entries(history_dir, config.max_history_entries)
-            except OSError:
-                pass
-
-        if options.copy or config.auto_copy:
-            ok = copy_fn(improved)
-            if ok:
-                # No stderr chatter in --quiet mode; success is the
-                # absence of a warning.
-                pass
-
-        print(
-            format_output(
-                output=options.output,
-                original=original_prompt,
-                improved=improved,
-                turns=1 + new_turns_count,
-                session_id=session.session_id,
-                backend_name=backend_short,
-                model=config.default_model,
-            ),
-            file=stdout,
-        )
-        return EXIT_OK
 
     # ----- interactive path (with optional auto-iterations) -----
 
@@ -1417,21 +1495,41 @@ def main(
 
     # --backend auto: clear persistence BEFORE resolving (per resolve.py
     # contract — explicit-auto is the user's "stop persisting" signal).
+    # Then reload so the just-written preference is visible to
+    # resolve_backend. Both steps are gated on the BACKEND_AUTO branch
+    # per M5 (issue #30) — the previous unconditional reload was a
+    # double-read on every run. The non-BACKEND_AUTO path keeps the
+    # config from the first apply_overrides above; concurrent edits to
+    # config.json between that load and this point are not observed.
     if options.backend == BACKEND_AUTO:
+        # M2 (issue #30): split OSError vs ConfigCorruptError so the
+        # user sees an actionable message on corruption instead of a
+        # generic I/O warning that hides the real cause.
         try:
             clear_backend_preference(config_path_p)
         except OSError:
             print(
-                "Warning: could not reset preferred backend.",
+                "Warning: could not reset preferred backend (I/O failure).",
                 file=stderr_in,
             )
-
-    # Re-load config so the just-written preferred_backend is visible
-    # to resolve_backend.
-    config = apply_overrides(
-        load_config(config_path_p),
-        _config_overrides_from_options(options),
-    )
+        except ConfigCorruptError:
+            print(
+                f"Warning: could not reset preferred backend — "
+                f"{config_path_p} is corrupt; edit or delete it to recover.",
+                file=stderr_in,
+            )
+        # M1 (issue #30): the reload path must catch ConfigCorruptError
+        # too — the file may have become corrupt between the first load
+        # and this point (concurrent --clear-config, external edit, or
+        # disk corruption after the clear_backend_preference write).
+        try:
+            config = apply_overrides(
+                load_config(config_path_p),
+                _config_overrides_from_options(options),
+            )
+        except ConfigCorruptError as e:
+            print(str(e), file=stderr_in)
+            return EXIT_FAILURE
 
     system_prompt_path_resolved = resolve_system_prompt_path(
         config, cli_override=options.system_prompt
