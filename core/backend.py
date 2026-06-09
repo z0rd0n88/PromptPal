@@ -15,6 +15,19 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Any, TypeAlias
+
+
+#: One message on the wire between PromptPal and a backend.
+#:
+#: At minimum carries ``{"role": "user"|"assistant", "content": <string-or-block-array>}``;
+#: ``content`` can be a bare string (callers' shape) or a block-array
+#: ``[{"type":"text","text":"..."}]`` after normalization in
+#: :func:`core.cli_backend._normalize_content`. Typed as
+#: ``dict[str, Any]`` rather than ``TypedDict`` because the value shape
+#: is heterogeneous; the alias is a documentation hook so a future
+#: tightening to ``TypedDict`` lands in one place.
+Message: TypeAlias = dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -43,14 +56,33 @@ class Backend(ABC):
     def complete(
         self,
         system: str,
-        messages: list[dict],
+        messages: list[Message],
         stream: bool = False,
     ) -> BackendResponse:
-        """Execute one completion turn and return the assembled response."""
+        """Execute one completion turn and return the assembled response.
+
+        ``messages`` follows the :data:`Message` wire shape — see the
+        alias docstring at the top of this module for the per-element
+        contract.
+        """
 
     @abstractmethod
     def check_auth(self) -> bool:
-        """Lightweight liveness/auth probe (used by ``--status`` and first-run setup)."""
+        """Lightweight liveness/auth probe (used by ``--status`` and first-run setup).
+
+        Implementations may interpret "auth" with backend-appropriate
+        strictness:
+
+        - :class:`core.api_backend.ApiBackend` fires a real
+          ``max_tokens=1`` round-trip — a true auth check.
+        - :class:`core.cli_backend.CliBackend` runs ``claude --version``,
+          which probes binary presence rather than OAuth liveness. A
+          real auth check there would require an interactive OAuth
+          round-trip unsuitable for ``--status``.
+
+        The bool return reflects the strongest confidence the backend
+        can establish without user interaction (M14 — issue #30).
+        """
 
 
 class NoBackendError(Exception):

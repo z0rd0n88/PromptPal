@@ -517,6 +517,91 @@ def test_iter_sse_ignores_malformed_json_lines() -> None:
 
 
 # ---------------------------------------------------------------------------
+# H5 — _iter_sse closes underlying response (issue #30)
+# ---------------------------------------------------------------------------
+
+
+class _ClosableBytes(io.BytesIO):
+    """``BytesIO`` that records whether ``close()`` was invoked.
+
+    The real urllib ``HTTPResponse`` exposes ``close()`` that releases the
+    underlying socket; a leaked response keeps the socket open until GC.
+    """
+
+    def __init__(self, raw: bytes) -> None:
+        super().__init__(raw)
+        self.close_calls: int = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+        super().close()
+
+
+def test_iter_sse_closes_response_on_normal_iteration() -> None:
+    """H5: when the consumer drains all events normally, the underlying
+    response must be closed so the HTTP socket is released."""
+    raw = b'data: {"type":"a"}\n\ndata: [DONE]\n\n'
+    resp = _ClosableBytes(raw)
+    events = list(_iter_sse(resp))
+    assert events == [{"type": "a"}]
+    assert resp.close_calls == 1, "resp.close() must run after normal iteration"
+
+
+def test_iter_sse_closes_response_when_consumer_stops_early() -> None:
+    """H5: when the consumer exits mid-stream (the realistic leak scenario
+    — e.g. an exception during ``_consume_stream``), the generator's
+    ``finally`` block must still run ``resp.close()``."""
+    raw = b'data: {"type":"a"}\n\ndata: {"type":"b"}\n\ndata: {"type":"c"}\n\n'
+    resp = _ClosableBytes(raw)
+    gen = _iter_sse(resp)
+    next(gen)  # consume one event
+    gen.close()  # consumer abandons the stream
+    assert resp.close_calls == 1, (
+        "resp.close() must run when the consumer stops iterating early"
+    )
+
+
+def test_iter_sse_tolerates_response_without_close() -> None:
+    """H5: a response-like object without ``close()`` (some test fakes,
+    older stdlib objects) must not cause the generator to crash."""
+
+    class _NoCloseBytes(io.BytesIO):
+        close = None  # type: ignore[assignment]
+
+    resp = _NoCloseBytes(b'data: {"type":"a"}\n\n')
+    # Must not raise even though ``close`` is None.
+    events = list(_iter_sse(resp))
+    assert events == [{"type": "a"}]
+
+
+# ---------------------------------------------------------------------------
+# M15 — _iter_sse UTF-8 strictness (issue #30)
+# ---------------------------------------------------------------------------
+
+
+def test_iter_sse_skips_lines_with_invalid_utf8() -> None:
+    """M15: a line with invalid UTF-8 used to be silently mangled by
+    ``errors="replace"`` — replacing the bad bytes with U+FFFD and yielding
+    a corrupted JSON. Strict decode + skip surfaces the corruption cleanly:
+    the bad line drops, the rest of the stream parses normally."""
+    # 0xff is never valid in UTF-8 in any position.
+    raw = b'data: {"bad":"\xff\xff"}\n\ndata: {"good":true}\n\n'
+    events = list(_iter_sse(io.BytesIO(raw)))
+    assert events == [{"good": True}], (
+        "invalid-UTF-8 line must be skipped, not yielded with replacement chars"
+    )
+
+
+def test_iter_sse_preserves_valid_multibyte_utf8() -> None:
+    """M15: valid multi-byte UTF-8 inside a line must round-trip cleanly.
+    No regression in handling legitimate non-ASCII content."""
+    # ``data: {"emoji":"🎯"}`` with the rocket inside as actual UTF-8 bytes.
+    raw = 'data: {"emoji":"🎯"}\n\n'.encode("utf-8")
+    events = list(_iter_sse(io.BytesIO(raw)))
+    assert events == [{"emoji": "🎯"}]
+
+
+# ---------------------------------------------------------------------------
 # Retry-After parsing
 # ---------------------------------------------------------------------------
 

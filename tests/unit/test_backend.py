@@ -24,6 +24,7 @@ from core.api_backend import ApiKeyMissingError
 from core.backend import (
     Backend,
     BackendResponse,
+    Message,
     NoBackendError,
 )
 from core.cli_backend import CliNotFoundError
@@ -117,7 +118,7 @@ def test_minimal_concrete_backend_satisfies_contract():
         def complete(
             self,
             system: str,
-            messages: list[dict],
+            messages: list[Message],
             stream: bool = False,
         ) -> BackendResponse:
             return BackendResponse(text="ok", input_tokens=1, output_tokens=2)
@@ -169,6 +170,22 @@ def test_no_backend_error_is_a_plain_exception():
     """SPEC §6: ``NoBackendError(Exception)`` — not RuntimeError, not a custom base."""
     assert issubclass(NoBackendError, Exception)
     assert NoBackendError.__bases__ == (Exception,)
+
+
+def test_message_type_alias_exists():
+    """H6 (issue #30): ``Backend.complete``'s message-wire type uses a
+    documented ``Message`` alias instead of bare ``list[dict]``.
+
+    The alias is ``dict[str, Any]`` — type-safety boost is purely
+    documentation, but a future change to ``TypedDict`` can land without
+    touching every callsite.
+    """
+    # The alias is importable and resolves to a dict-shaped type.
+    # We don't pin it to ``dict[str, Any]`` exactly because the alias may
+    # later tighten to a TypedDict — but it must remain dict-compatible.
+    msg: Message = {"role": "user", "content": "hi"}
+    assert isinstance(msg, dict)
+    assert msg["role"] == "user"
 
 
 def test_no_backend_error_has_spec_message():

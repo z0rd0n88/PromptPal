@@ -589,6 +589,68 @@ def test_summarize_stdout_failure_empty_and_garbage_return_empty() -> None:
     assert _summarize_stdout_failure(b"not json\n{broken\n") == ""
 
 
+def test_summarize_stdout_failure_marks_subtype_as_enum_token() -> None:
+    """M13 (issue #30): when only ``subtype`` carries the failure reason
+    (no ``error`` / ``result`` text on the event), the enum-shaped token
+    must be flagged with ``(subtype)`` so the user sees ``"error_during_
+    execution (subtype)"`` instead of a bare enum token they have to
+    decode from context.
+    """
+    # Result-error event with only ``subtype`` populated — no human-string
+    # ``error`` or ``result`` field. This is what the CLI emits for some
+    # internal-error paths.
+    event = {
+        "type": "result",
+        "is_error": True,
+        "subtype": "error_during_execution",
+    }
+    stdout = (json.dumps(event) + "\n").encode("utf-8")
+    summary = _summarize_stdout_failure(stdout)
+    assert "error_during_execution" in summary
+    assert "(subtype)" in summary, (
+        "subtype enum token must be flagged so the user can tell it apart "
+        "from a free-form failure message; got: " + summary
+    )
+
+
+def test_summarize_stdout_failure_does_not_mark_free_form_error_message() -> None:
+    """M13: a free-form ``error`` string must NOT be suffixed with
+    ``(subtype)`` — only the enum-token fallback gets the marker."""
+    event = {
+        "type": "result",
+        "is_error": True,
+        "error": "free-form human reason here",
+    }
+    stdout = (json.dumps(event) + "\n").encode("utf-8")
+    summary = _summarize_stdout_failure(stdout)
+    assert summary == "free-form human reason here"
+    assert "(subtype)" not in summary
+
+
+def test_summarize_stdout_failure_subtype_suffix_survives_truncation() -> None:
+    """M13 follow-up: review-driven fix. The ``(subtype)`` marker is
+    appended AFTER the 500-char truncation so a near-cap enum token
+    can't silently chop the suffix mid-word.
+
+    Real subtype enums are short (e.g. ``error_during_execution`` = 22
+    chars), but the test pins the recipe so a future drift can't break
+    it. We construct a pathological 600-char subtype payload to force
+    the truncation path through the new code.
+    """
+    long_subtype = "x" * 600
+    event = {
+        "type": "result",
+        "is_error": True,
+        "subtype": long_subtype,
+    }
+    stdout = (json.dumps(event) + "\n").encode("utf-8")
+    summary = _summarize_stdout_failure(stdout)
+    assert summary.endswith(" (subtype)"), (
+        f"(subtype) suffix must remain intact even when the source value "
+        f"exceeds the 500-char truncation cap; got: ...{summary[-30:]}"
+    )
+
+
 def test_summarize_stdout_failure_requires_system_type_for_api_retry() -> None:
     """P1-FIX-28-05: ``subtype: "api_retry"`` is only a retry event when
     paired with ``type: "system"``. Other types reusing the subtype must

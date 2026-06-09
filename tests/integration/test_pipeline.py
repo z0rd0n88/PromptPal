@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import io
 
-from core.backend import Backend, BackendResponse
+from core.backend import Backend, BackendResponse, Message
 from core.loop import (
     CHOICE_PROMPT,
     COPY_SUCCESS_MESSAGE,
@@ -65,7 +65,7 @@ class FakeBackend(Backend):
         return self._name
 
     def complete(
-        self, system: str, messages: list[dict], stream: bool = False
+        self, system: str, messages: list[Message], stream: bool = False
     ) -> BackendResponse:
         if not self._responses:
             raise AssertionError(
@@ -860,7 +860,7 @@ def test_backend_mutation_of_messages_does_not_corrupt_state():
             return "mutator"
 
         def complete(
-            self, system: str, messages: list[dict], stream: bool = False
+            self, system: str, messages: list[Message], stream: bool = False
         ) -> BackendResponse:
             messages.clear()  # ATTACK: try to wipe the loop's history
             messages.append({"role": "user", "content": "INJECTED"})

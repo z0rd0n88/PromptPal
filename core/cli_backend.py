@@ -108,7 +108,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from core.backend import Backend, BackendResponse
+from core.backend import Backend, BackendResponse, Message
 
 
 # ---------------------------------------------------------------------------
@@ -413,6 +413,7 @@ def _summarize_stdout_failure(stdout: bytes) -> str:
     the original exit code.
     """
     result_reason = ""
+    result_is_subtype_enum = False
     last_retry: dict[str, Any] | None = None
     retry_count = 0
     for raw_line in stdout.splitlines():
@@ -430,6 +431,13 @@ def _summarize_stdout_failure(stdout: bytes) -> str:
                 value = event.get(key)
                 if isinstance(value, str) and value.strip():
                     result_reason = value.strip()
+                    # M13 (issue #30): the ``subtype`` field is an enum
+                    # token (e.g. ``error_during_execution``), not a
+                    # human-readable failure reason. Track that fact so
+                    # the suffix can be appended AFTER the 500-char
+                    # truncation below — otherwise a near-cap reason
+                    # could swallow the marker mid-word.
+                    result_is_subtype_enum = key == "subtype"
                     break
         elif (
             event.get("type") == "system"
@@ -441,7 +449,10 @@ def _summarize_stdout_failure(stdout: bytes) -> str:
             retry_count += 1
             last_retry = event
     if result_reason:
-        return result_reason[:500]
+        truncated = result_reason[:500]
+        if result_is_subtype_enum:
+            truncated = f"{truncated} (subtype)"
+        return truncated
     if last_retry is not None:
         return _format_retry_summary(last_retry, retry_count)[:500]
     return ""
@@ -480,7 +491,7 @@ class CliBackend(Backend):
     def complete(
         self,
         system: str,
-        messages: list[dict],
+        messages: list[Message],
         stream: bool = False,
     ) -> BackendResponse:
         """Send a single completion turn through ``claude``.
@@ -521,7 +532,14 @@ class CliBackend(Backend):
         return BackendResponse(text=text, input_tokens=None, output_tokens=None)
 
     def check_auth(self) -> bool:
-        """Run ``claude --version`` and return ``True`` on exit 0 (P1-BKND-12)."""
+        """Run ``claude --version`` and return ``True`` on exit 0 (P1-BKND-12).
+
+        Binary-presence probe only — a real OAuth liveness check would
+        need interactive user input, unsuitable for ``--status``. See
+        :meth:`core.backend.Backend.check_auth` for the two-tier
+        rationale (M14, issue #30) and how this differs from
+        :meth:`core.api_backend.ApiBackend.check_auth`'s real round-trip.
+        """
         try:
             result = self._runner([self._executable, "--version"], b"")
         except CliNotFoundError:
