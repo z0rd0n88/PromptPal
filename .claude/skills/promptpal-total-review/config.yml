@@ -1,0 +1,165 @@
+# promptpal-total-review configuration. Consumed by
+# ~/.claude/skills/total-review/REFERENCE.md at every invocation.
+
+project:
+  slug: promptpal
+  stack: python
+  repo: z0rd0n88/PromptPal
+  invariants:
+    - "core/ is stdlib-only (PRD D-1/D-2) — no third-party imports, no requirements.txt, no pyproject runtime deps."
+    - "claude-cli stream-json: --bare breaks OAuth; --verbose required; failures land on stdout with empty stderr; message content MUST be a block array, never a bare string."
+    - "User-state files in ~/.promptpal/ are written through core/_io.py atomic helpers — direct open('w') is a silent-failure smell."
+    - "Tests and docstrings pin requirement IDs (P1-AREA-NN) from PRD-PHASE1.md; preserve them on edits."
+    - "Tests run via `uv run --with pytest python -m pytest`; pyright runs via `uv run --with pyright --with pytest pyright core tests` — hardcoded `python -m pytest` is broken on a fresh clone."
+    - "The installed snapshot at ~/.promptpal/lib/ is what `promptpal` actually runs — git pull alone does not take effect; install.sh must re-run."
+    # NDJSON envelope-wrapping contract (core/cli_backend.py:_serialize_messages_ndjson):
+    - "Each message piped to `claude` on stdin MUST be wrapped as {\"type\": role, \"message\": {...}}; a bare {\"role\": ..., \"content\": ...} envelope is silently ignored — claude exits 0 with NO assistant reply (hooks still fire). Cite core/cli_backend.py:_serialize_messages_ndjson."
+    # System-prompt tempfile invariants (core/cli_backend.py:_write_system_prompt_tempfile; NFR-08 / P1-PLAT-08):
+    - "The system-prompt tempfile (passed via --system-prompt-file) MUST be 0600 and written with LF-only line endings — both are enforced by core/cli_backend.py:_write_system_prompt_tempfile (NFR-08, P1-PLAT-08). CRLF or wider perms regress the contract."
+    # Adversary surfaces (mirrors SKILL.md "Adversaries to model in `security` mode"):
+    - "Prompt-injection adversary: user-supplied prompt is concatenated with the system prompt and forwarded to the backend; the iterate loop re-feeds model output into the next turn, so escape paths there are CRITICAL."
+    - "Filesystem-traversal adversary: any path joined under ~/.promptpal/ (history, config, system-prompt overrides) with attacker-influenced filenames MUST traversal-check before open()."
+    - "Untrusted-NDJSON adversary: `claude` stream-json output is parsed line-by-line; a hostile line must NEITHER raise an exception that aborts response assembly NOR inject into the assembled output. Per-line drop is the documented design."
+    - "Env-var → argv injection adversary: config-driven flags piped into the `claude` argv must not enable shell-metacharacter abuse (subprocess uses argv list, not shell=True — preserve that)."
+    - "WSL HOME-hijack adversary: bin/promptpal MUST guard HOME=/home/alex (or equivalent WSL-native HOME) — a bleed to /mnt/c/Users/<x>/ leaks credentials and state outside the ext4 home."
+    # Explicit launcher invariant:
+    - "WSL HOME-guard: bin/promptpal MUST enforce HOME=/home/alex (the launcher's HOME-routing check) — any code path that lets the launcher execute under a Windows-side HOME is a CRITICAL regression."
+
+# Layer slices. Each declared `lenses` list is the per-slice allowlist —
+# only agents in `mode.agents ∩ slice.lenses` actually run on this slice.
+#
+# Convention: declare either `path:` (directory glob) or `paths:` (explicit
+# file list) on a slice, not both. Mixed declarations were dropped 2026-06-07.
+slices:
+  cli:
+    # CLI orchestration layer — flags, exit codes, top-level I/O routing.
+    # core/resolve.py lives here (it's a path resolver, not a state writer).
+    # silent-failure-hunter owns the exit-code / error funnel for this slice.
+    paths:
+      - core/cli.py
+      - core/main.py
+      - core/__init__.py
+      - core/resolve.py
+    lenses:
+      - code-reviewer
+      - python-reviewer
+      - python-pro
+      - critical-thinking
+      - code-architect
+      - silent-failure-hunter
+
+  backends:
+    # Both backend adapters + the abstract base. The fragile part of the codebase
+    # per CLAUDE.md; cli-backend-reviewer is the project-specific lens.
+    paths:
+      - core/backend.py
+      - core/api_backend.py
+      - core/cli_backend.py
+    lenses:
+      - code-reviewer
+      - python-reviewer
+      - python-pro
+      - cli-backend-reviewer
+      - security-reviewer
+      - silent-failure-hunter
+      - code-architect
+
+  state:
+    # Config + history + system-prompt + atomic I/O — everything that touches
+    # ~/.promptpal/. history-persistence-reviewer is the project-specific lens.
+    # (core/resolve.py moved to `cli` — it's a path resolver, not a state writer.)
+    paths:
+      - core/config.py
+      - core/history.py
+      - core/system_prompt.py
+      - core/_io.py
+    lenses:
+      - code-reviewer
+      - python-reviewer
+      - python-pro
+      - history-persistence-reviewer
+      - security-reviewer
+      - silent-failure-hunter
+      - code-architect
+
+  loop:
+    # Interactive accept/iterate/discard refinement, diff renderer, input parser.
+    paths:
+      - core/loop.py
+      - core/diff.py
+      - core/input.py
+    lenses:
+      - code-reviewer
+      - python-reviewer
+      - python-pro
+      - code-architect
+      - silent-failure-hunter
+
+  platform:
+    # Platform detection + winget launcher wiring.
+    paths:
+      - core/platform.py
+      - core/winget_launcher.py
+    lenses: [code-reviewer, python-reviewer, security-reviewer]
+
+  launchers_shell:
+    # Bash launcher + installer/uninstaller + Windows shell launchers.
+    paths:
+      - bin/promptpal
+      - install.sh
+      - uninstall.sh
+      - launcher/promptpal.cmd
+      - launcher/promptpal.ps1
+    lenses: [code-reviewer, security-reviewer, critical-thinking]
+
+  packaging:
+    # Winget manifests + the Python entry-point shim.
+    paths:
+      - launcher/winget/manifests/p/PromptPal/PromptPal/0.1.0/PromptPal.PromptPal.installer.yaml
+      - launcher/winget/manifests/p/PromptPal/PromptPal/0.1.0/PromptPal.PromptPal.locale.en-US.yaml
+      - launcher/winget/manifests/p/PromptPal/PromptPal/0.1.0/PromptPal.PromptPal.yaml
+      - promptpal_main.py
+    lenses: [code-reviewer, python-reviewer, critical-thinking]
+
+  tests:
+    # Narrow lens set — idiom reviewers don't fit test code. cli-backend-reviewer
+    # joins to catch fake-parity drift between FakeCliBackend / FakeApiBackend
+    # and their production counterparts.
+    path: tests
+    lenses: [code-reviewer, tdd-guide, cli-backend-reviewer]
+
+# Mode overrides — declared additively against REFERENCE.md canonical defaults.
+# Use `agents_add` / `agents_remove` so canonical baseline + stack overlay
+# evolutions reach this wrapper without copy-paste.
+modes:
+  # Two PromptPal-specific lenses extend `code` and `architecture` modes:
+  # cli-backend-reviewer (the `claude` argv + stream-json layer) and
+  # history-persistence-reviewer (the ~/.promptpal/history writer). Per-slice
+  # lens allowlists above decide where they actually run.
+  code:
+    agents_add: [cli-backend-reviewer, history-persistence-reviewer]
+  architecture:
+    agents_add: [cli-backend-reviewer, history-persistence-reviewer]
+  # `perf` mode intentionally NOT overridden — REFERENCE.md's conditional
+  # `+ sql-pro if any *.sql present` already omits sql-pro when no SQL is
+  # present (true for PromptPal). Letting the default flow keeps this wrapper
+  # honest if a future feature adds SQL.
+
+tracker:
+  # gh issue list --label A,B,C is AND semantics, not OR. To union labels we
+  # iterate per-label and merge with jq. Pattern documented in
+  # ~/.claude/skills/total-review/REFERENCE.md → "Failure modes & guards".
+  exclusion_query: |
+    set -eo pipefail
+    for label in review tech-debt security performance architecture; do
+      gh issue list --repo z0rd0n88/PromptPal --state open --limit 30 \
+        --label "$label" --json number,title,body
+    done | jq -s 'add | unique_by(.number)'
+  file_issue: |
+    gh issue create --repo z0rd0n88/PromptPal --title "{title}" --body-file - \
+      --label review
+  title_template: "{mode} review: {crit} CRITICAL · {high} HIGH · {med} MEDIUM · {low} LOW"
+  # PromptPal has no meta-tracker issue. Leaving cross_ref_phrase unset (YAML
+  # null) tells REFERENCE.md to drop the trailing template line entirely —
+  # canonical "absent" marker. (Empty string "" is treated identically.)
+  cross_ref_phrase:
