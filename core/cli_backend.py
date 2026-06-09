@@ -108,7 +108,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from core.backend import Backend, BackendResponse
+from core.backend import Backend, BackendResponse, Message
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +430,13 @@ def _summarize_stdout_failure(stdout: bytes) -> str:
                 value = event.get(key)
                 if isinstance(value, str) and value.strip():
                     result_reason = value.strip()
+                    # M13 (issue #30): the ``subtype`` field is an enum
+                    # token (e.g. ``error_during_execution``), not a
+                    # human-readable failure reason. Mark it so the user
+                    # can tell the fallback apart from a real error
+                    # message coming through ``error`` / ``result``.
+                    if key == "subtype":
+                        result_reason = f"{result_reason} (subtype)"
                     break
         elif (
             event.get("type") == "system"
@@ -480,7 +487,7 @@ class CliBackend(Backend):
     def complete(
         self,
         system: str,
-        messages: list[dict],
+        messages: list[Message],
         stream: bool = False,
     ) -> BackendResponse:
         """Send a single completion turn through ``claude``.

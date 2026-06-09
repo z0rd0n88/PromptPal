@@ -56,11 +56,11 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Iterable, Iterator
+from collections.abc import Generator, Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from core.backend import Backend, BackendResponse
+from core.backend import Backend, BackendResponse, Message
 
 
 # ---------------------------------------------------------------------------
@@ -164,25 +164,50 @@ raised, so the retry loop can inspect them uniformly.
 # ---------------------------------------------------------------------------
 
 
-def _iter_sse(resp: Any) -> Iterator[dict]:
+def _iter_sse(resp: Any) -> Generator[dict, None, None]:
     """Yield parsed SSE events from a urllib HTTPResponse-like file object.
 
     Events are JSON objects on ``data:`` lines; comments (``:``), empty
     lines, and the ``[DONE]`` sentinel are silently skipped.
+
+    H5 (issue #30): the underlying response is explicitly ``close()``'d
+    in a ``finally`` block so the socket isn't leaked when the consumer
+    exits mid-stream — the generator's ``finally`` fires on both normal
+    completion and on ``GeneratorExit`` (i.e. when the consumer calls
+    ``gen.close()`` or is garbage-collected mid-iteration).
+
+    M15 (issue #30): UTF-8 decode is now strict (``decode("utf-8")``
+    rather than ``errors="replace"``). A line with invalid UTF-8 is
+    skipped cleanly via ``UnicodeDecodeError`` rather than yielding a
+    silently corrupted event with U+FFFD replacement characters.
     """
-    for raw_line in resp:
-        line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
-        if not line or line.startswith(":"):
-            continue
-        if not line.startswith("data:"):
-            continue
-        data = line[len("data:") :].lstrip()
-        if data == "[DONE]":
-            return
-        try:
-            yield json.loads(data)
-        except json.JSONDecodeError:
-            continue
+    try:
+        for raw_line in resp:
+            try:
+                line = raw_line.decode("utf-8").rstrip("\r\n")
+            except UnicodeDecodeError:
+                continue
+            if not line or line.startswith(":"):
+                continue
+            if not line.startswith("data:"):
+                continue
+            data = line[len("data:") :].lstrip()
+            if data == "[DONE]":
+                return
+            try:
+                yield json.loads(data)
+            except json.JSONDecodeError:
+                continue
+    finally:
+        # Some response-like objects (older test fakes, partial-protocol
+        # stand-ins) don't expose ``close``. Tolerate the absence so the
+        # generator never crashes on cleanup.
+        close = getattr(resp, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
 
 
 def _default_transport(
@@ -280,7 +305,7 @@ class ApiBackend(Backend):
     def complete(
         self,
         system: str,
-        messages: list[dict],
+        messages: list[Message],
         stream: bool = False,
     ) -> BackendResponse:
         """Send a single completion turn.
@@ -327,7 +352,7 @@ class ApiBackend(Backend):
         self,
         *,
         system: str,
-        messages: list[dict],
+        messages: list[Message],
         max_tokens: int,
         stream: bool,
     ) -> dict[str, Any]:
