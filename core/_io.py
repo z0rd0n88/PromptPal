@@ -50,7 +50,7 @@ from pathlib import Path
 from typing import Any
 
 
-def _fsync_dir_best_effort(directory: Path) -> None:
+def fsync_dir_best_effort(directory: Path) -> None:
     """Open ``directory`` and ``os.fsync`` its fd, swallowing OSError.
 
     POSIX systems persist a rename to the inode/dirent map only after the
@@ -140,7 +140,7 @@ def atomic_write_bytes(
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, target)
-        _fsync_dir_best_effort(target.parent)
+        fsync_dir_best_effort(target.parent)
     except BaseException:  # signal-safe: clean up tempfile even on KeyboardInterrupt
         if tmp_path.exists():
             try:

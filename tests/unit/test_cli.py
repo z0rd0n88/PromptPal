@@ -671,13 +671,13 @@ class TestTryWriteSessionH4:
 
         sid = "abc12345af81440ca0f1e7085dadf89d"
         session = _make_session_for_export(sid)
+
+        def boom_upsert(*args: object, **kwargs: object) -> None:
+            raise TypeError("schema drift")
+
         # Make upsert raise a non-OSError; pre-fix code lets this propagate
         # and the test assertion catching it would never fire.
-        monkeypatch.setattr(
-            cli_module,
-            "upsert_index_entry",
-            lambda *a, **k: (_ for _ in ()).throw(TypeError("schema drift")),
-        )
+        monkeypatch.setattr(cli_module, "upsert_index_entry", boom_upsert)
         stderr = io.StringIO()
         cli_module._try_write_session(session, tmp_path, stderr=stderr)
         err = stderr.getvalue()
@@ -702,11 +702,11 @@ class TestTryWriteSessionH4:
 
         sid = "abc12345af81440ca0f1e7085dadf89d"
         session = _make_session_for_export(sid)
-        monkeypatch.setattr(
-            cli_module,
-            "upsert_index_entry",
-            lambda *a, **k: (_ for _ in ()).throw(TypeError("schema drift")),
-        )
+
+        def boom_upsert(*args: object, **kwargs: object) -> None:
+            raise TypeError("schema drift")
+
+        monkeypatch.setattr(cli_module, "upsert_index_entry", boom_upsert)
         stderr = io.StringIO()
         cli_module._try_write_session(session, tmp_path, stderr=stderr)
         # The session file must NOT remain — it would be an orphan.
@@ -727,14 +727,13 @@ class TestTryWriteSessionH4:
 
         upsert_calls: list[None] = []
 
-        def fake_upsert(*a, **k):  # type: ignore[no-untyped-def]
+        def fake_upsert(*args: object, **kwargs: object) -> None:
             upsert_calls.append(None)
 
-        monkeypatch.setattr(
-            cli_module,
-            "write_session",
-            lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")),
-        )
+        def boom_write_session(*args: object, **kwargs: object) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(cli_module, "write_session", boom_write_session)
         monkeypatch.setattr(cli_module, "upsert_index_entry", fake_upsert)
         stderr = io.StringIO()
         cli_module._try_write_session(session, tmp_path, stderr=stderr)

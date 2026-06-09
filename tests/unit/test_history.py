@@ -19,6 +19,7 @@ both fields deterministically.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 from pathlib import Path
@@ -451,6 +452,43 @@ def test_resolve_ignores_index_json(tmp_path):
         resolve_session_id("index", tmp_path)
 
 
+def test_resolve_session_id_fast_path_rejects_traversal_id(tmp_path):
+    """H1 follow-up: ``resolve_session_id``'s exact-match fast-path calls
+    ``session_path`` which now raises ``InvalidSessionIdError`` on
+    traversal ids. The fast-path must convert that to a plain
+    ``SessionNotFoundError`` so callers see a consistent "id not found"
+    diagnostic instead of an unhandled exception.
+    """
+    _seed_session(tmp_path, "abc12345af81440ca0f1e7085dadf89d")
+    with pytest.raises(SessionNotFoundError) as exc:
+        resolve_session_id("../../etc/passwd", tmp_path)
+    # Plain SessionNotFoundError, not the InvalidSessionIdError subclass
+    # leaking through — the user-visible error stays in the "not found"
+    # vocabulary; security-relevant rejection is recorded by the layered
+    # defense in session_path.
+    assert type(exc.value) is SessionNotFoundError
+
+
+def test_resolve_session_id_fast_path_filters_in_dir_symlink(tmp_path):
+    """M12 follow-up: even an in-directory symlink with an exact-match id
+    must not resolve. The pre-followup code relied on H1 to catch
+    out-of-dir symlinks but left in-dir aliases reachable through the
+    exact-match branch.
+    """
+    real = tmp_path / "abc12345af81440ca0f1e7085dadf89d.json"
+    write_session(
+        _make_session(session_id="abc12345af81440ca0f1e7085dadf89d"), tmp_path
+    )
+    assert real.is_file()
+
+    # An in-directory symlink shaped like a session file.
+    link = tmp_path / "def00000af81440ca0f1e7085dadf89d.json"
+    link.symlink_to(real)
+
+    with pytest.raises(SessionNotFoundError):
+        resolve_session_id("def00000af81440ca0f1e7085dadf89d", tmp_path)
+
+
 def test_resolve_session_id_glob_filters_symlinks(tmp_path):
     """M12 (issue #30): a UUID-named symlink in ``history_dir`` must not
     pollute the prefix-scan glob.
@@ -526,6 +564,19 @@ def test_session_path_accepts_valid_hex_id(tmp_path):
     """H1: regular UUID-hex ids work exactly as before — no false positives."""
     result = session_path(tmp_path, "b4449351af81440ca0f1e7085dadf89d")
     assert result == tmp_path / "b4449351af81440ca0f1e7085dadf89d.json"
+
+
+def test_session_path_truncates_long_session_id_in_error_message(tmp_path):
+    """H1 follow-up: an unbounded session_id value (e.g. round-tripped from a
+    hostile prompt injection through a corrupted index row) must not leak
+    its full content into the stderr-printed exception message."""
+    long_payload = "../etc/" + ("A" * 200)
+    with pytest.raises(InvalidSessionIdError) as exc:
+        session_path(tmp_path, long_payload)
+    # Truncated + ellipsis present; full payload NOT present.
+    assert "AAA" in str(exc.value)  # something of the payload survived
+    assert "..." in str(exc.value)  # truncation marker present
+    assert long_payload not in str(exc.value)  # full untruncated NOT present
 
 
 # ---------------------------------------------------------------------------
@@ -638,6 +689,93 @@ def test_read_index_skips_dict_with_missing_required_keys(tmp_path):
     entries = read_index(tmp_path)
     assert len(entries) == 1
     assert entries[0].session_id == "abc12345"
+
+
+def test_read_index_emits_stderr_warning_when_rows_dropped(tmp_path, capsys):
+    """H3 follow-up: silent per-row drops were a regression in observability.
+
+    A single summary stderr line per call surfaces "history present but
+    degraded" without flooding stderr per malformed row. The user can
+    distinguish "no history" from "corrupt index" without having to grep
+    the file by hand.
+    """
+    good_row = {
+        "session_id": "abc12345",
+        "created_at": "2026-05-01T00:00:00Z",
+        "label": None,
+        "status": STATUS_IN_PROGRESS,
+        "original_prompt_preview": "p",
+    }
+    payload = json.dumps([good_row, "bad", None, {"missing": "keys"}])
+    (tmp_path / INDEX_FILE_NAME).write_text(payload, encoding="utf-8")
+    read_index(tmp_path)
+    err = capsys.readouterr().err
+    assert "3" in err  # 3 rows dropped (string, null, missing-keys dict)
+    assert "malformed row" in err
+
+
+def test_read_index_no_warning_on_clean_index(tmp_path, capsys):
+    """H3 follow-up: the stderr warning must NOT fire when the index is
+    intact — otherwise every normal CLI run is noisier than before."""
+    good_row = {
+        "session_id": "abc12345",
+        "created_at": "2026-05-01T00:00:00Z",
+        "label": None,
+        "status": STATUS_IN_PROGRESS,
+        "original_prompt_preview": "p",
+    }
+    (tmp_path / INDEX_FILE_NAME).write_text(
+        json.dumps([good_row]), encoding="utf-8"
+    )
+    read_index(tmp_path)
+    assert capsys.readouterr().err == ""
+
+
+def test_enforce_max_entries_tolerates_corrupted_traversal_session_id(
+    tmp_path, monkeypatch
+):
+    """Slice 2 follow-up (security review HIGH): a corrupted index row with
+    a traversal-style ``session_id`` used to abort the eviction loop because
+    ``session_path`` (H1) now raises ``InvalidSessionIdError`` and the loop
+    only caught ``FileNotFoundError``. Mid-loop abort would corrupt the
+    truncated-index write that follows.
+
+    With the widened catch, the malformed row is silently dropped from the
+    index just like missing files are tolerated — the docstring's
+    "idempotent on a partial run" promise extends to malformed ids too.
+    """
+    # Pre-seed a real session that should survive eviction.
+    write_session(_make_session(session_id="abc12345af81440ca0f1e7085dadf89d"), tmp_path)
+    # Hand-write an index.json carrying both a clean row and a corrupted
+    # row whose session_id is a traversal string. We bypass write_index
+    # because the index writer would itself trip on the bad id.
+    rows = [
+        {
+            "session_id": "abc12345af81440ca0f1e7085dadf89d",
+            "created_at": "2026-05-02T00:00:00Z",  # newer; kept
+            "label": None,
+            "status": STATUS_IN_PROGRESS,
+            "original_prompt_preview": "real",
+        },
+        {
+            "session_id": "../../etc/passwd",
+            "created_at": "2026-05-01T00:00:00Z",  # older; evicted first
+            "label": None,
+            "status": STATUS_IN_PROGRESS,
+            "original_prompt_preview": "bad",
+        },
+    ]
+    (tmp_path / INDEX_FILE_NAME).write_text(json.dumps(rows), encoding="utf-8")
+
+    # Squelch the H3 stderr warning so it doesn't clutter the test log.
+    monkeypatch.setattr("sys.stderr", io.StringIO())
+
+    evicted = enforce_max_entries(tmp_path, max_entries=1)
+    # The corrupted row must be evicted (dropped from the truncated index)
+    # rather than abort the loop. The clean row stays.
+    assert "../../etc/passwd" in evicted
+    remaining = [e.session_id for e in read_index(tmp_path)]
+    assert remaining == ["abc12345af81440ca0f1e7085dadf89d"]
 
 
 def test_write_index_atomic_no_temp_leftovers(tmp_path):

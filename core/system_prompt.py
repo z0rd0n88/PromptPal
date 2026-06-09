@@ -67,7 +67,7 @@ import urllib.request
 from pathlib import Path
 from typing import Callable
 
-from core._io import _fsync_dir_best_effort, atomic_write_bytes
+from core._io import fsync_dir_best_effort, atomic_write_bytes
 from core.config import Config
 
 
@@ -240,7 +240,7 @@ def seed_system_prompt(
             f.write(payload)
             f.flush()
             os.fsync(f.fileno())
-        _fsync_dir_best_effort(target.parent)
+        fsync_dir_best_effort(target.parent)
     except BaseException:  # signal-safe: don't leave a partial seed behind
         try:
             target.unlink()
