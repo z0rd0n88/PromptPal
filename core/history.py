@@ -59,6 +59,7 @@ from __future__ import annotations
 import json
 import sys
 import uuid
+import sys
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -125,6 +126,16 @@ class AmbiguousSessionIdError(HistoryError):
         super().__init__(
             f"Session id {prefix!r} is ambiguous ({len(matches)} matches)"
         )
+
+
+class InvalidSessionIdError(SessionNotFoundError):
+    """Raised when a session_id would escape ``history_dir`` on join.
+
+    Inherits :class:`SessionNotFoundError` so existing ``--resume`` /
+    ``--export`` error handlers cover it without code change; the
+    distinct class lets tests pin the path-traversal guard separately
+    from a genuine "not found" miss.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -374,9 +385,51 @@ def finalize_session(
 # ---------------------------------------------------------------------------
 
 
+_SESSION_ID_TRUNC_LIMIT: int = 64
+"""Truncation cap for session-id values surfaced in error messages.
+
+A session-id can arrive from a hostile prompt or a corrupted on-disk
+row; the error path prints it verbatim to stderr. Truncating at this
+limit caps the worst-case leak and keeps the diagnostic readable.
+"""
+
+
 def session_path(history_dir: Path, session_id: str) -> Path:
-    """Return ``<history_dir>/<session_id>.json`` (P1-HIST-01)."""
-    return Path(history_dir) / f"{session_id}{SESSION_FILE_SUFFIX}"
+    """Return ``<history_dir>/<session_id>.json`` (P1-HIST-01).
+
+    Validates that the joined path lives directly inside ``history_dir``
+    — a ``session_id`` of ``../../etc/passwd`` would otherwise escape via
+    ``Path /`` semantics (``Path("/h") / "/etc/passwd"`` collapses to
+    ``Path("/etc/passwd")`` entirely; ``Path("/h") / "../../etc/passwd"``
+    resolves to ``/etc/passwd``). UUID-hex ids from
+    :func:`_default_id_factory` are safe by construction, but ids that
+    flow through ``--resume <id>`` or a corrupted ``index.json`` are
+    user-controlled and must not become a file-write primitive anywhere
+    on disk.
+
+    The check is "resolved parent must equal resolved ``history_dir``"
+    rather than "starts with" so nested-directory ids (``foo/bar``) are
+    also rejected — sessions are intentionally flat, one file per id.
+
+    Raises :class:`InvalidSessionIdError` (a :class:`SessionNotFoundError`
+    subclass) when the containment check fails. The error message
+    truncates ``session_id`` to :data:`_SESSION_ID_TRUNC_LIMIT` so a
+    pathological value (e.g. from a hostile prompt injection round-trip)
+    can't leak unbounded bytes to stderr.
+    """
+    history_dir = Path(history_dir)
+    candidate = history_dir / f"{session_id}{SESSION_FILE_SUFFIX}"
+    history_resolved = history_dir.resolve()
+    candidate_resolved = candidate.resolve()
+    if candidate_resolved.parent != history_resolved:
+        truncated = session_id[:_SESSION_ID_TRUNC_LIMIT]
+        if len(session_id) > _SESSION_ID_TRUNC_LIMIT:
+            truncated += "..."
+        raise InvalidSessionIdError(
+            f"Session id {truncated!r} would escape history directory "
+            f"{history_dir}"
+        )
+    return candidate
 
 
 def index_path(history_dir: Path) -> Path:
@@ -439,19 +492,37 @@ def resolve_session_id(id_or_prefix: str, history_dir: str | Path) -> str:
     """
     history_dir = Path(history_dir)
     if id_or_prefix:
-        candidate = session_path(history_dir, id_or_prefix)
-        # Guard against id_or_prefix == "index" resolving to index.json.
-        # Both the exact-match branch (here) and the prefix-scan branch
-        # (below) need this guard, intentionally asymmetric: exact-match
-        # returns the id directly; prefix-scan falls through to the glob.
-        if candidate.exists() and candidate.name != INDEX_FILE_NAME:
+        # ``session_path`` itself enforces the H1 containment check, so a
+        # traversal-style id surfaces here as ``InvalidSessionIdError``
+        # rather than reaching ``candidate.exists()``. Re-raise as a plain
+        # ``SessionNotFoundError`` so the user-visible diagnostic stays in
+        # the "id not found" vocabulary; the security-relevant rejection is
+        # already recorded by the layered defense.
+        try:
+            candidate = session_path(history_dir, id_or_prefix)
+        except InvalidSessionIdError:
+            raise SessionNotFoundError(
+                f"Session {id_or_prefix!r} not found"
+            ) from None
+        # Guard against id_or_prefix == "index" resolving to index.json,
+        # and against an in-directory symlink masquerading as a session.
+        # The symlink filter mirrors the M12 fix below in the prefix-scan
+        # branch — closed at the resolution boundary instead of leaving
+        # the H1 containment check as the sole rescue.
+        if (
+            candidate.exists()
+            and candidate.name != INDEX_FILE_NAME
+            and not candidate.is_symlink()
+        ):
             return id_or_prefix
     else:
         raise SessionNotFoundError(f"Session {id_or_prefix!r} not found")
     matches = sorted(
         p.stem
         for p in history_dir.glob(f"*{SESSION_FILE_SUFFIX}")
-        if p.name != INDEX_FILE_NAME and p.stem.startswith(id_or_prefix)
+        if p.name != INDEX_FILE_NAME
+        and not p.is_symlink()
+        and p.stem.startswith(id_or_prefix)
     )
     if len(matches) == 1:
         return matches[0]
@@ -490,11 +561,21 @@ def index_entry_from_session(session: Session) -> IndexEntry:
 def read_index(history_dir: str | Path) -> list[IndexEntry]:
     """Read the newest-first index. Missing/corrupt file → empty list.
 
-    A truncated, non-JSON, or non-list ``index.json`` returns ``[]``
-    instead of raising — corruption must not abort the run (P1-FIX-28-06
-    / P1-HIST-08). The ``_try_write_session`` warning helper only
-    catches ``OSError``, so handling decode errors at the read site
-    keeps :func:`read_index` uniformly tolerant.
+    A truncated, non-JSON, non-list-root, or per-row malformed
+    ``index.json`` returns the longest valid set of rows it can salvage
+    instead of raising — corruption must not abort the run
+    (P1-FIX-28-06 / P1-HIST-08).
+
+    Per-entry tolerance: each list element is filtered through
+    ``isinstance(row, dict)`` first, and :func:`IndexEntry.from_dict`'s
+    ``KeyError`` / ``TypeError`` / ``ValueError`` failures are swallowed
+    — one bad row must not orphan the rest of the index. ``ValueError``
+    is included for forward-compatibility with future validators on the
+    :class:`IndexEntry` constructor.
+
+    Degraded reads are not silent: if any row is dropped, a one-line
+    summary lands on stderr so the user can tell "no history" from
+    "history present but degraded".
     """
     target = index_path(Path(history_dir))
     if not target.exists():
@@ -505,7 +586,23 @@ def read_index(history_dir: str | Path) -> list[IndexEntry]:
         return []
     if not isinstance(data, list):
         return []
-    return [IndexEntry.from_dict(d) for d in data]
+    entries: list[IndexEntry] = []
+    dropped = 0
+    for row in data:
+        if not isinstance(row, dict):
+            dropped += 1
+            continue
+        try:
+            entries.append(IndexEntry.from_dict(row))
+        except (KeyError, TypeError, ValueError):
+            dropped += 1
+            continue
+    if dropped:
+        print(
+            f"warning: skipped {dropped} malformed row(s) in {target}",
+            file=sys.stderr,
+        )
+    return entries
 
 
 def write_index(entries: list[IndexEntry], history_dir: str | Path) -> Path:
@@ -582,10 +679,17 @@ def enforce_max_entries(history_dir: str | Path, max_entries: int) -> list[str]:
     history_dir_path = Path(history_dir)
     evicted_ids: list[str] = []
     for row in evict:
-        target = session_path(history_dir_path, row.session_id)
+        # ``session_path`` enforces the H1 containment check, so a
+        # corrupted index row with a traversal-style id raises
+        # ``InvalidSessionIdError`` here rather than producing a
+        # write/unlink primitive outside ``history_dir``. Tolerate it
+        # alongside the documented ``FileNotFoundError`` so a single bad
+        # row cannot abort the whole eviction loop and corrupt the
+        # newly-written index.
         try:
+            target = session_path(history_dir_path, row.session_id)
             target.unlink()
-        except FileNotFoundError:
+        except (FileNotFoundError, InvalidSessionIdError):
             pass
         evicted_ids.append(row.session_id)
     write_index(keep, history_dir)

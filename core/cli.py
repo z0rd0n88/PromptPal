@@ -59,6 +59,7 @@ from core.history import (
     STATUS_ACCEPTED,
     AmbiguousSessionIdError,
     IndexEntry,
+    InvalidSessionIdError,
     Session,
     SessionNotFoundError,
     append_turn,
@@ -72,6 +73,7 @@ from core.history import (
     read_session,
     resolve_session_id,
     search_history,
+    session_path,
     upsert_index_entry,
     write_session,
 )
@@ -952,14 +954,40 @@ def _try_write_session(
     """Write the session + index entry; warn on failure but never raise.
 
     P1-HIST-08 mandates that history failures must not abort the run.
-    Both writes are guarded; ``HISTORY_WRITE_WARNING`` is the canonical
-    P1-ERR-07 message and is pinned by tests.
+    ``HISTORY_WRITE_WARNING`` is the canonical P1-ERR-07 message and is
+    pinned by tests.
+
+    Split into two independently-guarded writes:
+
+    1. ``write_session`` — failure aborts the helper with a warning;
+       nothing else to clean up because the index hasn't been touched yet.
+    2. ``upsert_index_entry`` — failure removes the freshly-written
+       session file so it doesn't become a silent orphan that
+       ``--show-history`` / ``--search`` can never surface.
+
+    The catch is widened from ``OSError`` to ``Exception`` so a non-IO
+    failure in ``upsert_index_entry`` (``TypeError`` from a schema
+    drift, ``AttributeError`` from a malformed Session, future
+    schema-related errors) is treated as a history-degraded warning
+    instead of aborting the whole run.
     """
     try:
         write_session(session, history_dir)
-        upsert_index_entry(history_dir, index_entry_from_session(session))
-    except OSError as e:
+    except Exception as e:
         print(f"{HISTORY_WRITE_WARNING} (reason: {e})", file=stderr)
+        return
+    try:
+        upsert_index_entry(history_dir, index_entry_from_session(session))
+    except Exception as e:
+        print(f"{HISTORY_WRITE_WARNING} (reason: {e})", file=stderr)
+        # Orphan cleanup: the session landed but the index didn't.
+        # Remove the orphan so future --show-history / --search aren't
+        # blind to it forever. Best-effort — if removal fails too, the
+        # session is at worst a stale orphan, not active corruption.
+        try:
+            session_path(history_dir, session.session_id).unlink()
+        except (OSError, InvalidSessionIdError):
+            pass
 
 
 # ---------------------------------------------------------------------------

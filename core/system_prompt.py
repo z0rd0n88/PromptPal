@@ -60,13 +60,14 @@ complete — never a half-written file (NFR-04).
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Callable
 
-from core._io import atomic_write_bytes
+from core._io import fsync_dir_best_effort, atomic_write_bytes
 from core.config import Config
 
 
@@ -200,14 +201,52 @@ def seed_system_prompt(
     already existed (the P1-SP-02 no-overwrite guarantee). The target
     directory is created with ``parents=True, exist_ok=True``.
 
-    Bytes are streamed through :func:`shutil.copyfile`, so the bundled
-    file's LF line endings are preserved verbatim (P1-PLAT-08).
+    The seed write uses ``os.open`` with ``O_CREAT|O_EXCL|O_WRONLY`` so
+    the "does it exist?" check is atomic with the create at the syscall
+    level — the pre-fix ``Path.exists()`` + ``shutil.copyfile`` had a
+    TOCTOU window where a racing process could create the file between
+    the check and the copy, silently clobbering user content.
+
+    Mode is pinned to ``0o600`` so the seeded user-state file matches
+    the tempfile-side contract enforced in
+    :func:`core.cli_backend._write_system_prompt_tempfile` (NFR-08 /
+    P1-PLAT-08). LF line endings are preserved verbatim because we
+    write the bundled bytes through a binary-mode fd, never invoking
+    text-mode translation.
+
+    Durability: ``f.flush()`` + ``os.fsync(file_fd)`` + best-effort
+    parent-dir fsync, matching the recipe in
+    :func:`core._io.atomic_write_bytes` (NFR-04). The fd-leak guard
+    mirrors the same module's ``os.fdopen`` protection.
     """
     target = Path(target_path)
-    if target.exists():
-        return False
+    payload = Path(bundled_path).read_bytes()
     target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(str(bundled_path), str(target))
+    try:
+        fd = os.open(
+            str(target),
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            0o600,
+        )
+    except FileExistsError:
+        return False
+    try:
+        f = os.fdopen(fd, "wb")
+    except BaseException:  # signal-safe: close raw fd even on KeyboardInterrupt
+        os.close(fd)
+        raise
+    try:
+        with f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        fsync_dir_best_effort(target.parent)
+    except BaseException:  # signal-safe: don't leave a partial seed behind
+        try:
+            target.unlink()
+        except OSError:
+            pass
+        raise
     return True
 
 

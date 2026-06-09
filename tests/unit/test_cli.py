@@ -648,6 +648,102 @@ def _make_session_for_export(session_id: str) -> Session:
     )
 
 
+# ---------------------------------------------------------------------------
+# H4 — _try_write_session error-handling widening (issue #30)
+# ---------------------------------------------------------------------------
+
+
+class TestTryWriteSessionH4:
+    """``_try_write_session`` is the canonical P1-HIST-08 "history must
+    not abort the run" guard. The pre-fix code only catches ``OSError``
+    around both ``write_session`` + ``upsert_index_entry`` — so a
+    non-``OSError`` exception from ``upsert_index_entry`` (``TypeError``,
+    ``AttributeError``, future schema errors) leaves the session file on
+    disk while the index never records it: a silent orphan unreachable
+    by ``--show-history`` / ``--search``.
+    """
+
+    def test_widens_to_exception_subclass(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """H4: a non-OSError from upsert_index_entry must be caught + warned."""
+        from core import cli as cli_module
+
+        sid = "abc12345af81440ca0f1e7085dadf89d"
+        session = _make_session_for_export(sid)
+
+        def boom_upsert(*args: object, **kwargs: object) -> None:
+            raise TypeError("schema drift")
+
+        # Make upsert raise a non-OSError; pre-fix code lets this propagate
+        # and the test assertion catching it would never fire.
+        monkeypatch.setattr(cli_module, "upsert_index_entry", boom_upsert)
+        stderr = io.StringIO()
+        cli_module._try_write_session(session, tmp_path, stderr=stderr)
+        err = stderr.getvalue()
+        # Canonical warning surfaced so the user knows history is degraded.
+        from core.history import HISTORY_WRITE_WARNING
+
+        assert HISTORY_WRITE_WARNING in err
+        assert "schema drift" in err
+
+    def test_cleans_orphan_session_file_when_index_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """H4: if write_session succeeds but upsert_index_entry fails, the
+        orphan session file must be removed.
+
+        Otherwise ``--show-history`` / ``--search`` are blind to it forever
+        and ``--export <prefix>`` may surface it inconsistently with what
+        the listing shows. Cleanup turns the partial failure into a clean
+        no-history-row-for-this-turn instead of permanent disk litter.
+        """
+        from core import cli as cli_module
+
+        sid = "abc12345af81440ca0f1e7085dadf89d"
+        session = _make_session_for_export(sid)
+
+        def boom_upsert(*args: object, **kwargs: object) -> None:
+            raise TypeError("schema drift")
+
+        monkeypatch.setattr(cli_module, "upsert_index_entry", boom_upsert)
+        stderr = io.StringIO()
+        cli_module._try_write_session(session, tmp_path, stderr=stderr)
+        # The session file must NOT remain — it would be an orphan.
+        assert not (tmp_path / f"{sid}.json").exists(), (
+            "Orphan session file left on disk after index write failure — "
+            "future --show-history will not surface it"
+        )
+
+    def test_write_session_failure_does_not_attempt_index_or_cleanup(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """H4: when write_session itself fails, upsert must not run + there
+        is no orphan to clean up. The warn still fires."""
+        from core import cli as cli_module
+
+        sid = "abc12345af81440ca0f1e7085dadf89d"
+        session = _make_session_for_export(sid)
+
+        upsert_calls: list[None] = []
+
+        def fake_upsert(*args: object, **kwargs: object) -> None:
+            upsert_calls.append(None)
+
+        def boom_write_session(*args: object, **kwargs: object) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(cli_module, "write_session", boom_write_session)
+        monkeypatch.setattr(cli_module, "upsert_index_entry", fake_upsert)
+        stderr = io.StringIO()
+        cli_module._try_write_session(session, tmp_path, stderr=stderr)
+        from core.history import HISTORY_WRITE_WARNING
+
+        assert HISTORY_WRITE_WARNING in stderr.getvalue()
+        assert upsert_calls == [], "upsert must not run when write_session fails"
+        assert not (tmp_path / f"{sid}.json").exists()
+
+
 # ===========================================================================
 # AC #6 — cmd_status
 # ===========================================================================
