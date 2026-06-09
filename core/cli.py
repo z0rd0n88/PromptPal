@@ -1000,6 +1000,7 @@ def _run_quiet_pipeline(
     options: CLIOptions,
     config: Config,
     history_dir: Path,
+    usage_log_path: Path,
     backend: Backend,
     backend_short: str,
     system: str,
@@ -1025,6 +1026,11 @@ def _run_quiet_pipeline(
     The shared header (read prompt, first turn, build session, persist
     backend preference, incremental write) lives in ``_run_pipeline``
     and is run before this helper is called.
+
+    M4 (issue #30): writes one ``append_usage_entry`` row per
+    synthesized iteration, mirroring the interactive branch. The first
+    turn's usage row was already written by ``_run_pipeline`` before
+    the fork.
     """
     improved = first_response.text
     messages = list(initial_messages)
@@ -1060,6 +1066,24 @@ def _run_quiet_pipeline(
                 clock=clock,
             )
             new_turns_count += 1
+            # M4: per-iteration usage entry — parity with the interactive
+            # branch. ``turn_index`` starts at 1 because the first turn
+            # (index 0) was logged in ``_run_pipeline`` before the fork.
+            if config.history_enabled and not options.no_history:
+                try:
+                    append_usage_entry(
+                        usage_log_path,
+                        session_id=session.session_id,
+                        turn_index=new_turns_count,
+                        backend=backend_short,
+                        model=config.default_model,
+                        input_tokens=response.input_tokens,
+                        output_tokens=response.output_tokens,
+                        clock=clock,
+                    )
+                except OSError:
+                    # Usage log writes are non-fatal (P1-HIST-08-adjacent).
+                    pass
     except Exception as e:  # noqa: BLE001
         print(f"Error: {e}", file=stderr)
         return EXIT_FAILURE
@@ -1078,11 +1102,9 @@ def _run_quiet_pipeline(
             pass
 
     if options.copy or config.auto_copy:
-        ok = copy_fn(improved)
-        if ok:
-            # No stderr chatter in --quiet mode; success is the
-            # absence of a warning.
-            pass
+        # No stderr chatter in --quiet mode; copy_fn's success/failure
+        # is intentionally not surfaced (AC #3 — quiet means quiet).
+        copy_fn(improved)
 
     print(
         format_output(
@@ -1150,15 +1172,22 @@ def _run_pipeline(
 
     # Persist the explicit backend choice now that the first turn succeeded.
     if options.backend in (BACKEND_CLI, BACKEND_API):
+        # M2 (issue #30): persist_backend_preference internally calls
+        # load_config which can raise ConfigCorruptError. Both failures
+        # are non-fatal here (the run already produced a response), but
+        # they merit distinct user-facing messages — OSError is transient
+        # I/O, ConfigCorruptError needs user intervention.
         try:
             persist_backend_preference(config_path, options.backend)  # type: ignore[arg-type]
-        except (OSError, ConfigCorruptError):
-            # M2 (issue #30): persist_backend_preference internally calls
-            # load_config, which can raise ConfigCorruptError. Config-write
-            # / load failures are non-fatal here — the run already produced
-            # a response. Surface a warning to stderr.
+        except OSError:
             print(
-                "Warning: could not persist preferred backend.",
+                "Warning: could not persist preferred backend (I/O failure).",
+                file=stderr,
+            )
+        except ConfigCorruptError:
+            print(
+                f"Warning: could not persist preferred backend — "
+                f"{config_path} is corrupt; edit or delete it to recover.",
                 file=stderr,
             )
 
@@ -1221,6 +1250,7 @@ def _run_pipeline(
             options=options,
             config=config,
             history_dir=history_dir,
+            usage_log_path=usage_log_path,
             backend=backend,
             backend_short=backend_short,
             system=system,
@@ -1468,15 +1498,24 @@ def main(
     # Then reload so the just-written preference is visible to
     # resolve_backend. Both steps are gated on the BACKEND_AUTO branch
     # per M5 (issue #30) — the previous unconditional reload was a
-    # double-read on every run.
+    # double-read on every run. The non-BACKEND_AUTO path keeps the
+    # config from the first apply_overrides above; concurrent edits to
+    # config.json between that load and this point are not observed.
     if options.backend == BACKEND_AUTO:
+        # M2 (issue #30): split OSError vs ConfigCorruptError so the
+        # user sees an actionable message on corruption instead of a
+        # generic I/O warning that hides the real cause.
         try:
             clear_backend_preference(config_path_p)
-        except (OSError, ConfigCorruptError):
-            # M2 (issue #30): clear_backend_preference internally calls
-            # load_config which can raise ConfigCorruptError.
+        except OSError:
             print(
-                "Warning: could not reset preferred backend.",
+                "Warning: could not reset preferred backend (I/O failure).",
+                file=stderr_in,
+            )
+        except ConfigCorruptError:
+            print(
+                f"Warning: could not reset preferred backend — "
+                f"{config_path_p} is corrupt; edit or delete it to recover.",
                 file=stderr_in,
             )
         # M1 (issue #30): the reload path must catch ConfigCorruptError
