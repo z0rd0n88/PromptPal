@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -62,16 +63,33 @@ def _fsync_dir_best_effort(directory: Path) -> None:
     Python builds disallow ``os.open`` on a directory altogether. The
     write itself is already complete by the time we get here, so a failure
     in this step must not propagate.
+
+    ``O_DIRECTORY`` is added on platforms that expose it (Linux) so a
+    racing rename of ``directory`` to a symlink between the file
+    ``os.replace`` and our ``os.open`` cannot redirect us to an unrelated
+    fd. ``getattr(os, "O_DIRECTORY", 0)`` keeps the call portable.
+
+    ``PermissionError`` (EACCES) is logged to stderr rather than silenced:
+    a directory we just successfully wrote into shouldn't refuse to open
+    for fsync, so the error indicates a real misconfiguration (wrong ACL,
+    wrong owner) the user should know about, not a platform tolerance.
     """
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     try:
-        dir_fd = os.open(str(directory), os.O_RDONLY)
+        dir_fd = os.open(str(directory), flags)
+    except PermissionError as e:
+        print(
+            f"warning: cannot fsync parent dir {directory} "
+            f"(durability not guaranteed for this write): {e}",
+            file=sys.stderr,
+        )
+        return
     except OSError:
         return
     try:
-        try:
-            os.fsync(dir_fd)
-        except OSError:
-            pass
+        os.fsync(dir_fd)
+    except OSError:
+        pass
     finally:
         os.close(dir_fd)
 
@@ -114,7 +132,7 @@ def atomic_write_bytes(
     try:
         try:
             f = os.fdopen(fd, "wb")
-        except BaseException:
+        except BaseException:  # signal-safe: close raw fd even on KeyboardInterrupt
             os.close(fd)
             raise
         with f:
@@ -123,7 +141,7 @@ def atomic_write_bytes(
             os.fsync(f.fileno())
         os.replace(tmp_path, target)
         _fsync_dir_best_effort(target.parent)
-    except Exception:
+    except BaseException:  # signal-safe: clean up tempfile even on KeyboardInterrupt
         if tmp_path.exists():
             try:
                 tmp_path.unlink()

@@ -328,7 +328,7 @@ def test_write_system_prompt_tempfile_closes_raw_fd_when_fdopen_raises(
         closed_fds.append(fd)
         real_close(fd)
 
-    def hooked_fdopen(fd: int, *args, **kwargs):  # type: ignore[no-untyped-def]
+    def hooked_fdopen(fd: int, *args: Any, **kwargs: Any) -> Any:
         raise OSError(24, "Too many open files")  # EMFILE
 
     monkeypatch.setattr("core.cli_backend.os.close", hooked_close)
@@ -337,9 +337,9 @@ def test_write_system_prompt_tempfile_closes_raw_fd_when_fdopen_raises(
     with pytest.raises(OSError, match="Too many open files"):
         _write_system_prompt_tempfile("anything")
 
-    assert closed_fds, (
-        "fd from mkstemp must be os.close'd when os.fdopen raises before "
-        "adopting it; got no os.close calls"
+    assert len(closed_fds) == 1, (
+        "fd from mkstemp must be os.close'd exactly once when os.fdopen "
+        f"raises before adopting it; got {len(closed_fds)} closes ({closed_fds})"
     )
 
 

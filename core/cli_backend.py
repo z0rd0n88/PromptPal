@@ -553,7 +553,7 @@ def _write_system_prompt_tempfile(system: str) -> str:
     try:
         try:
             f = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
-        except BaseException:
+        except BaseException:  # signal-safe: close raw fd even on KeyboardInterrupt
             os.close(fd)
             raise
         with f:

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -78,7 +79,7 @@ def test_atomic_write_bytes_fsyncs_file_then_replaces_then_fsyncs_parent_dir(
 
     dir_fds: set[int] = set()
 
-    def hooked_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+    def hooked_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
         fd = real_open(path, flags, *args, **kwargs)
         try:
             if os.path.isdir(path):
@@ -90,9 +91,9 @@ def test_atomic_write_bytes_fsyncs_file_then_replaces_then_fsyncs_parent_dir(
     def hooked_fsync(fd: int) -> None:
         log.append("fsync_dir" if fd in dir_fds else "fsync_file")
 
-    def hooked_replace(src, dst, *args, **kwargs):  # type: ignore[no-untyped-def]
+    def hooked_replace(src: Any, dst: Any, *args: Any, **kwargs: Any) -> None:
         log.append("replace")
-        return real_replace(src, dst, *args, **kwargs)
+        real_replace(src, dst, *args, **kwargs)
 
     monkeypatch.setattr("core._io.os.open", hooked_open)
     monkeypatch.setattr("core._io.os.fsync", hooked_fsync)
@@ -123,7 +124,7 @@ def test_atomic_write_bytes_swallows_parent_dir_fsync_oserror(
     real_open = os.open
     dir_fds: set[int] = set()
 
-    def hooked_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+    def hooked_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
         fd = real_open(path, flags, *args, **kwargs)
         try:
             if os.path.isdir(path):
@@ -144,7 +145,7 @@ def test_atomic_write_bytes_swallows_parent_dir_fsync_oserror(
 
 
 def test_atomic_write_bytes_swallows_parent_dir_open_oserror(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """C1: if even opening the parent dir for fsync fails, swallow.
 
@@ -152,21 +153,59 @@ def test_atomic_write_bytes_swallows_parent_dir_open_oserror(
     a directory at all. The write itself has succeeded by then; the dir-fsync
     is purely best-effort durability beyond what ``os.replace`` already
     guarantees, so it must not fail the call.
+
+    Uses ``OSError(EINVAL)`` here — a plausible platform-tolerance code that
+    is NOT auto-promoted to :class:`PermissionError`. ``PermissionError`` is
+    tested separately because it indicates a real misconfiguration and is
+    logged to stderr rather than silently swallowed.
     """
     target = tmp_path / "x.json"
 
     real_open = os.open
     parent_str = str(target.parent)
 
-    def hooked_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+    def hooked_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
         if str(path) == parent_str:
-            raise OSError(13, "Permission denied")
+            raise OSError(22, "Invalid argument")  # EINVAL — platform tolerance
         return real_open(path, flags, *args, **kwargs)
 
     monkeypatch.setattr("core._io.os.open", hooked_open)
 
     atomic_write_bytes(target, b"hello", prefix=".x-", suffix=".json")
     assert target.read_bytes() == b"hello"
+    # Platform-tolerance OSError must NOT print to stderr.
+    assert capsys.readouterr().err == ""
+
+
+def test_atomic_write_bytes_warns_on_parent_dir_permission_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """C1: ``PermissionError`` on the parent-dir open is a real misconfiguration
+    signal (wrong ACL, wrong owner), not platform tolerance.
+
+    Silent-swallow would hide a genuine durability gap: the user's write
+    completes but the directory entry is not fsynced, and the root cause is
+    invisible. Surface it on stderr so the user can fix the permissions
+    before the next crash eats the rename.
+    """
+    target = tmp_path / "x.json"
+
+    real_open = os.open
+    parent_str = str(target.parent)
+
+    def hooked_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if str(path) == parent_str:
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr("core._io.os.open", hooked_open)
+
+    # Call must still succeed — the file write itself isn't blocked.
+    atomic_write_bytes(target, b"hello", prefix=".x-", suffix=".json")
+    assert target.read_bytes() == b"hello"
+    err = capsys.readouterr().err
+    assert "fsync parent dir" in err
+    assert "Permission denied" in err
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +232,7 @@ def test_atomic_write_bytes_closes_raw_fd_when_fdopen_raises(
         closed_fds.append(fd)
         real_close(fd)
 
-    def hooked_fdopen(fd: int, *args, **kwargs):  # type: ignore[no-untyped-def]
+    def hooked_fdopen(fd: int, *args: Any, **kwargs: Any) -> Any:
         raise OSError(24, "Too many open files")  # EMFILE
 
     monkeypatch.setattr("core._io.os.close", hooked_close)
@@ -202,9 +241,9 @@ def test_atomic_write_bytes_closes_raw_fd_when_fdopen_raises(
     with pytest.raises(OSError, match="Too many open files"):
         atomic_write_bytes(target, b"hi", prefix=".x-", suffix=".json")
 
-    assert closed_fds, (
-        "fd from mkstemp must be os.close'd when os.fdopen raises before "
-        "adopting it; got no os.close calls"
+    assert len(closed_fds) == 1, (
+        "fd from mkstemp must be os.close'd exactly once when os.fdopen "
+        f"raises before adopting it; got {len(closed_fds)} closes ({closed_fds})"
     )
 
 
@@ -217,7 +256,7 @@ def test_atomic_write_bytes_unlinks_tempfile_when_fdopen_raises(
     """
     target = tmp_path / "x.json"
 
-    def hooked_fdopen(fd: int, *args, **kwargs):  # type: ignore[no-untyped-def]
+    def hooked_fdopen(fd: int, *args: Any, **kwargs: Any) -> Any:
         raise OSError(24, "Too many open files")
 
     monkeypatch.setattr("core._io.os.fdopen", hooked_fdopen)
