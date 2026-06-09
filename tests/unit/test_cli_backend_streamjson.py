@@ -627,6 +627,53 @@ def test_summarize_stdout_failure_does_not_mark_free_form_error_message() -> Non
     assert "(subtype)" not in summary
 
 
+def test_stream_kwarg_is_a_no_op_on_the_wire(make_backend) -> None:
+    """H11 (issue #30): ``CliBackend.complete(stream=True)`` must produce
+    byte-identical argv + stdin to ``CliBackend.complete(stream=False)``.
+
+    P1-FIX-28-01/02 mandates ``stream=True`` is a no-op on the CLI path
+    — the CLI's stream-json output already arrives in chunks, and the
+    P1-PIPE-07 "stream to terminal" UX flow runs entirely on the
+    pipeline side. A regression that started threading ``stream`` into
+    ``_build_argv`` or ``_serialize_messages_ndjson`` would change the
+    wire shape and (at best) confuse Claude's stream-json parser.
+
+    This is the wire-level invariant — the loop-side complement lives
+    in ``tests/integration/test_pipeline.py::
+    test_loop_passes_stream_false_to_backend_each_call``.
+    """
+    backend1, runner1 = make_backend(
+        [_ok(_ndjson(_assistant_event("ok")))]
+    )
+    backend1.complete("sys", [{"role": "user", "content": "hi"}], stream=False)
+
+    backend2, runner2 = make_backend(
+        [_ok(_ndjson(_assistant_event("ok")))]
+    )
+    backend2.complete("sys", [{"role": "user", "content": "hi"}], stream=True)
+
+    # argv shape is identical except for the runtime-generated
+    # ``--system-prompt-file`` path (mkstemp picks a fresh name per
+    # call). Strip that single arg from both before comparing.
+    def _argv_without_temp_path(argv: list[str]) -> list[str]:
+        try:
+            idx = argv.index("--system-prompt-file")
+        except ValueError:
+            return list(argv)
+        return argv[:idx] + argv[idx + 2 :]
+
+    argv1 = _argv_without_temp_path(runner1.calls[0]["argv"])
+    argv2 = _argv_without_temp_path(runner2.calls[0]["argv"])
+    assert argv1 == argv2, (
+        f"argv must not depend on stream= kwarg; got\n"
+        f"  stream=False: {argv1}\n  stream=True:  {argv2}"
+    )
+    assert runner1.calls[0]["stdin"] == runner2.calls[0]["stdin"], (
+        "stdin (the NDJSON messages payload) must be byte-identical "
+        "regardless of stream= value"
+    )
+
+
 def test_summarize_stdout_failure_subtype_suffix_survives_truncation() -> None:
     """M13 follow-up: review-driven fix. The ``(subtype)`` marker is
     appended AFTER the 500-char truncation so a near-cap enum token

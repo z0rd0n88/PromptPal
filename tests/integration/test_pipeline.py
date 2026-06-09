@@ -46,10 +46,29 @@ from core.loop import (
 class FakeBackend(Backend):
     """Backend that pops pre-seeded responses off a queue.
 
-    Each ``complete()`` call records the (system, messages) pair it was
-    invoked with and returns the next response in the queue. When the
-    queue empties, raises ``AssertionError`` so a misconfigured test
-    fails loudly instead of looping forever.
+    Each ``complete()`` call records the ``(system, messages, stream)``
+    triple it was invoked with and returns the next response in the
+    queue. When the queue empties, raises ``AssertionError`` so a
+    misconfigured test fails loudly instead of looping forever.
+
+    H12 (issue #30): ``calls[n][1]`` carries the pre-serialization
+    ``messages`` shape — content is whatever the loop passed in (bare
+    strings in the integration test fixtures). The production
+    :class:`core.cli_backend.CliBackend` normalizes content into the
+    block-array wire shape ``[{"type":"text","text":...}]`` inside
+    :func:`core.cli_backend._serialize_messages_ndjson`; the
+    authoritative wire-shape pin for that normalization lives in
+    ``tests/unit/test_cli_backend_streamjson.py``
+    (``test_serialize_multiturn_content_is_block_shaped`` and
+    siblings). Integration tests assert on this fake's pre-
+    serialization shape because the normalization is verified
+    end-to-end by the unit suite.
+
+    H11 (issue #30): every call records ``stream`` so a regression
+    that changes which value the loop passes (or starts varying it
+    per turn) is caught — pre-fix code silently dropped the kwarg,
+    leaving the P1-FIX-28-01/02 "``stream=True`` is a no-op on the
+    wire" invariant unprotected through the loop seam.
     """
 
     def __init__(
@@ -60,7 +79,8 @@ class FakeBackend(Backend):
     ) -> None:
         self._responses = list(responses)
         self._name = name
-        self.calls: list[tuple[str, list[dict[str, str]]]] = []
+        # Each entry: (system, messages, stream).
+        self.calls: list[tuple[str, list[dict[str, str]], bool]] = []
 
     @property
     def name(self) -> str:
@@ -74,7 +94,7 @@ class FakeBackend(Backend):
                 "FakeBackend: response queue exhausted — test wired the "
                 "wrong number of responses."
             )
-        self.calls.append((system, list(messages)))
+        self.calls.append((system, list(messages), stream))
         return self._responses.pop(0)
 
     def check_auth(self) -> bool:
@@ -209,6 +229,41 @@ def test_loop_writes_nothing_to_stdout(capsys):
 # ---------------------------------------------------------------------------
 
 
+def test_loop_passes_stream_false_to_backend_each_call():
+    """H11 (issue #30): the loop must pass ``stream=False`` to
+    ``backend.complete`` on every call.
+
+    Pre-fix code's FakeBackend silently dropped the ``stream`` kwarg, so
+    a regression that started passing ``stream=True`` (e.g. forwarding
+    a CLI flag through to the loop) would slip past every integration
+    assertion. With the kwarg now recorded in ``calls[n][2]``, this
+    test fences the P1-FIX-28-01/02 invariant at the loop seam.
+    """
+    backend = FakeBackend(
+        responses=[
+            BackendResponse(text="improved v1", input_tokens=1, output_tokens=2),
+            BackendResponse(text="improved v2", input_tokens=1, output_tokens=2),
+        ]
+    )
+    run_refinement_loop(
+        backend=backend,
+        system="sys",
+        initial_messages=_initial_messages(),
+        initial_improved="improved v1",
+        original_prompt="user prompt",
+        auto_iterations=1,
+        choice_reader=_make_choice_reader(["i", "a"]),
+        feedback_reader=_make_feedback_reader(["shorter"]),
+    )
+    assert backend.calls, "loop must call the backend at least once"
+    for index, (_system, _messages, stream) in enumerate(backend.calls):
+        assert stream is False, (
+            f"loop call #{index} passed stream={stream!r}; expected "
+            f"stream=False (P1-FIX-28-01/02 — stream is reserved for "
+            f"the first turn driven by the cli layer, not the loop)"
+        )
+
+
 def test_iterate_appends_user_feedback_then_calls_backend():
     """[i]terate: user feedback → user turn → backend call → assistant turn."""
     backend = FakeBackend(
@@ -231,7 +286,7 @@ def test_iterate_appends_user_feedback_then_calls_backend():
     assert len(backend.calls) == 1
     # Full messages array sent (4 entries: original user, v1 assistant,
     # feedback user, [v2 assistant lands AFTER the call]).
-    system, messages = backend.calls[0]
+    system, messages, _stream = backend.calls[0]
     assert system == "SYSTEM"
     assert messages == [
         {"role": "user", "content": "user prompt"},
