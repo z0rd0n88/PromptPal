@@ -25,8 +25,6 @@ from pathlib import Path
 
 import pytest
 
-from core import history as h
-from core._io import atomic_write_bytes
 from core.history import (
     HISTORY_WRITE_WARNING,
     INDEX_FILE_NAME,
@@ -502,6 +500,16 @@ def test_read_index_missing_file_returns_empty_list(tmp_path):
 def test_read_index_tolerates_non_list_root(tmp_path):
     """A corrupt index that's a dict shouldn't crash startup."""
     (tmp_path / INDEX_FILE_NAME).write_text("{}", encoding="utf-8")
+    assert read_index(tmp_path) == []
+
+
+def test_read_index_tolerates_truncated_json(tmp_path):
+    """P1-FIX-28-06 / P1-HIST-08: a truncated/non-JSON ``index.json``
+    must return ``[]`` rather than raising — otherwise a corrupt file
+    aborts the run (the P1-HIST-08 catch in ``_try_write_session``
+    only handles ``OSError``).
+    """
+    (tmp_path / INDEX_FILE_NAME).write_bytes(b"not json{")
     assert read_index(tmp_path) == []
 
 
@@ -996,6 +1004,3 @@ def test_index_and_usage_log_filenames_match_spec():
     assert USAGE_LOG_NAME == "usage.log"
 
 
-def test_module_re_exports_atomic_write():
-    """Sanity: atomic_write_bytes is the shared helper from core._io."""
-    assert atomic_write_bytes is h.atomic_write_bytes

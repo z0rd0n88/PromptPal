@@ -431,7 +431,13 @@ def _summarize_stdout_failure(stdout: bytes) -> str:
                 if isinstance(value, str) and value.strip():
                     result_reason = value.strip()
                     break
-        elif event.get("subtype") == "api_retry":
+        elif (
+            event.get("type") == "system"
+            and event.get("subtype") == "api_retry"
+        ):
+            # P1-FIX-28-05: match the documented system/api_retry wire
+            # shape; don't count other event types that happen to reuse
+            # the ``api_retry`` subtype.
             retry_count += 1
             last_retry = event
     if result_reason:

@@ -441,6 +441,9 @@ def resolve_session_id(id_or_prefix: str, history_dir: str | Path) -> str:
     if id_or_prefix:
         candidate = session_path(history_dir, id_or_prefix)
         # Guard against id_or_prefix == "index" resolving to index.json.
+        # Both the exact-match branch (here) and the prefix-scan branch
+        # (below) need this guard, intentionally asymmetric: exact-match
+        # returns the id directly; prefix-scan falls through to the glob.
         if candidate.exists() and candidate.name != INDEX_FILE_NAME:
             return id_or_prefix
     else:
@@ -485,11 +488,21 @@ def index_entry_from_session(session: Session) -> IndexEntry:
 
 
 def read_index(history_dir: str | Path) -> list[IndexEntry]:
-    """Read the newest-first index. Missing file → empty list."""
+    """Read the newest-first index. Missing/corrupt file → empty list.
+
+    A truncated, non-JSON, or non-list ``index.json`` returns ``[]``
+    instead of raising — corruption must not abort the run (P1-FIX-28-06
+    / P1-HIST-08). The ``_try_write_session`` warning helper only
+    catches ``OSError``, so handling decode errors at the read site
+    keeps :func:`read_index` uniformly tolerant.
+    """
     target = index_path(Path(history_dir))
     if not target.exists():
         return []
-    data = json.loads(target.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
     if not isinstance(data, list):
         return []
     return [IndexEntry.from_dict(d) for d in data]

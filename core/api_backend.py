@@ -82,6 +82,12 @@ NETWORK_RETRY_DELAY_SECONDS: float = 2.0
 DEFAULT_RATE_LIMIT_DELAY_SECONDS: float = 1.0
 SERVER_ERROR_BACKOFF_SECONDS: tuple[float, ...] = (1.0, 2.0, 4.0)
 
+# P1-FIX-28-04: the retry loop indexes SERVER_ERROR_BACKOFF_SECONDS by
+# server_retries (0..MAX_SERVER_ERROR_RETRIES-1); enforce the invariant
+# at import time so a future tuning of either constant can't silently
+# regress into an IndexError on the final retry.
+assert len(SERVER_ERROR_BACKOFF_SECONDS) >= MAX_SERVER_ERROR_RETRIES
+
 NO_KEY_MESSAGE: str = (
     "Error: ANTHROPIC_API_KEY is not set.\n"
     'Set it with: export ANTHROPIC_API_KEY="sk-ant-..."'
@@ -279,12 +285,17 @@ class ApiBackend(Backend):
     ) -> BackendResponse:
         """Send a single completion turn.
 
-        Streaming is enabled only when both ``stream=True`` and
-        ``sys.stdout.isatty()``; otherwise a single non-stream call is
-        issued. Either path returns the full assistant text plus numeric
-        input/output token counts (P1-BKND-10).
+        ``stream`` controls only the *transport* (SSE vs single JSON
+        response) — it does **not** produce user-visible output on
+        stdout. Pipe-safety (P1-PIPE-09) reserves stdout for the final
+        improved prompt only; the stream path silently accumulates
+        deltas internally. Either path returns the full assistant text
+        plus numeric input/output token counts (P1-BKND-10).
         """
-        do_stream = bool(stream) and sys.stdout.isatty()
+        # P1-FIX-28-02: honor ``stream`` unconditionally — the previous
+        # ``sys.stdout.isatty()`` gate was meaningful only while the
+        # stream path tee'd deltas to stdout; that's gone (P1-FIX-28-01).
+        do_stream = bool(stream)
         payload = self._build_payload(
             system=system,
             messages=messages,
@@ -396,10 +407,12 @@ class ApiBackend(Backend):
     def _parse_response_body(self, body: bytes) -> BackendResponse:
         data = json.loads(body.decode("utf-8"))
         text_parts: list[str] = []
-        for block in data.get("content", []) or []:
+        # P1-FIX-28-03: ``content`` may be missing OR explicitly null;
+        # ``or []`` defends both, mirroring cli_backend._extract_text_from_event.
+        for block in data.get("content") or []:
             if isinstance(block, dict) and block.get("type") == "text":
                 text_parts.append(block.get("text", ""))
-        usage = data.get("usage", {}) or {}
+        usage = data.get("usage") or {}
         return BackendResponse(
             text="".join(text_parts),
             input_tokens=usage.get("input_tokens"),
@@ -420,9 +433,9 @@ class ApiBackend(Backend):
                 if delta.get("type") == "text_delta":
                     text = delta.get("text", "")
                     if text:
+                        # P1-FIX-28-01 / P1-PIPE-09: silently accumulate;
+                        # stdout is reserved for the final improved prompt.
                         acc.text_parts.append(text)
-                        sys.stdout.write(text)
-                        sys.stdout.flush()
             elif etype == "message_delta":
                 usage = event.get("usage") or {}
                 if "input_tokens" in usage:
