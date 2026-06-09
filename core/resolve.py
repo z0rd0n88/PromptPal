@@ -101,11 +101,24 @@ def _effective_preference(
       not whatever's persisted in Config).
     - ``None`` (no flag) falls through to Config.
     - Anything else (defensive: typo from caller) collapses to ``"auto"``.
+
+    M7 (issue #30): the previous two ``# type: ignore[return-value]``
+    suppressions masked a real narrowing gap. They've been replaced with
+    explicit per-branch checks against the literal values, which gives
+    pyright a typed narrowing into :data:`PreferredBackend` for each
+    return path.
     """
-    if preferred == "claude-cli" or preferred == "api-key":
-        return preferred  # type: ignore[return-value]
-    if preferred is None and config_preference in VALID_PREFERRED_BACKENDS:
-        return config_preference  # type: ignore[return-value]
+    if preferred == "claude-cli":
+        return preferred
+    if preferred == "api-key":
+        return preferred
+    if preferred is None:
+        if config_preference == "claude-cli":
+            return config_preference
+        if config_preference == "api-key":
+            return config_preference
+        if config_preference == "auto":
+            return config_preference
     return "auto"
 
 
