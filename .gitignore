@@ -29,3 +29,6 @@ Thumbs.db
 
 # Vendored ralph clone (downloaded locally, not part of project history)
 scripts/ralph/
+
+# WSL/NTFS mark-of-the-web cruft
+*:Zone.Identifier
