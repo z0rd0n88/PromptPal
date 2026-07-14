@@ -104,6 +104,11 @@ PromptPal/
 │   └── winget_launcher.py
 ├── defaults/  — factory-default `config.json` seeded into `~/.promptpal/` on first install and never overwritten on reinstall.
 │   └── config.json
+├── docs/
+│   └── agents/
+│       ├── domain.md
+│       ├── issue-tracker.md
+│       └── triage-labels.md
 ├── launcher/  — Windows-side thin launchers (`.cmd`, `.ps1`) and the winget package manifests that forward `promptpal` calls from PowerShell into WSL.
 │   ├── winget/
 │   │   └── manifests/
@@ -166,5 +171,5 @@ PromptPal/
 └── uninstall.sh  — bash uninstaller that removes `~/.local/bin/promptpal` and optionally purges the `~/.promptpal/` data directory.
 ```
 
-_Generated 2026-07-13 16:15 UTC · 96 files · 33 directories._
+_Generated 2026-07-14 18:31 UTC · 99 files · 35 directories._
 <!-- ARCH:TREE:END -->
