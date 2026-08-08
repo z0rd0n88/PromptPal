@@ -38,19 +38,19 @@ PromptPal/
 ├── .claude/  — project-scoped Claude Code config: custom agents, hook scripts, and skills (checks, smoke, reinstall, ralph) for development workflows on this repo.
 │   ├── agents/
 │   │   ├── cli-backend-reviewer.md
+│   │   ├── code-architect.md
+│   │   ├── code-explorer.md
+│   │   ├── code-reviewer.md
 │   │   ├── critical-thinking.md
 │   │   ├── documentation-expert.md
-│   │   ├── ecc-code-architect.md
-│   │   ├── ecc-code-explorer.md
-│   │   ├── ecc-code-reviewer.md
-│   │   ├── ecc-performance-optimizer.md
-│   │   ├── ecc-python-reviewer.md
-│   │   ├── ecc-refactor-cleaner.md
-│   │   ├── ecc-security-reviewer.md
-│   │   ├── ecc-silent-failure-hunter.md
-│   │   ├── ecc-tdd-guide.md
 │   │   ├── history-persistence-reviewer.md
+│   │   ├── performance-optimizer.md
 │   │   ├── python-pro.md
+│   │   ├── python-reviewer.md
+│   │   ├── refactor-cleaner.md
+│   │   ├── security-reviewer.md
+│   │   ├── silent-failure-hunter.md
+│   │   ├── tdd-guide.md
 │   │   └── unused-code-cleaner.md
 │   ├── hooks/
 │   │   ├── checks.sh
@@ -58,12 +58,12 @@ PromptPal/
 │   ├── skills/
 │   │   ├── checks/
 │   │   │   └── SKILL.md
-│   │   ├── ecc-python-patterns/
-│   │   │   └── SKILL.md
 │   │   ├── prd/
 │   │   │   └── SKILL.md
 │   │   ├── promptpal-total-review/
 │   │   │   ├── config.yml
+│   │   │   └── SKILL.md
+│   │   ├── python-patterns/
 │   │   │   └── SKILL.md
 │   │   ├── ralph/
 │   │   │   └── SKILL.md
@@ -166,5 +166,5 @@ PromptPal/
 └── uninstall.sh  — bash uninstaller that removes `~/.local/bin/promptpal` and optionally purges the `~/.promptpal/` data directory.
 ```
 
-_Generated 2026-07-13 16:15 UTC · 96 files · 33 directories._
+_Generated 2026-08-08 11:43 UTC · 96 files · 33 directories._
 <!-- ARCH:TREE:END -->
