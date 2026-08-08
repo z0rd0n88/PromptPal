@@ -47,9 +47,9 @@ In addition to OWASP A01–A10:
 
 ## Notes on agent availability
 
-- `ecc-code-explorer` and `ecc-code-architect` are parked at user scope as of 2026-06-07 and activated in this project under `.claude/agents/`. They light up automatically wherever `code-explorer` / `code-architect` appear in mode defaults or slice `lenses`.
+- `code-explorer` and `code-architect` are parked at user scope as of 2026-06-07 and activated in this project under `.claude/agents/`. They light up automatically wherever `code-explorer` / `code-architect` appear in mode defaults or slice `lenses`.
 - Two PromptPal-specific lenses are activated: `cli-backend-reviewer` (the `claude` argv + stream-json layer) and `history-persistence-reviewer` (the `~/.promptpal/history` writer). They join `code` and `architecture` modes additively via `agents_add` in `config.yml`; per-slice `lenses` allowlists decide where they run. `cli-backend-reviewer` also appears in `tests.lenses` to catch fake-parity drift between the production backends and their `tests/` fakes.
-- **Tool-capability split:** fix-capable agents (`python-pro`, `ecc-tdd-guide`, `ecc-refactor-cleaner`, `unused-code-cleaner`) deliberately retain `Write` / `Edit` so they can author tests and execute refactors in fix-pass dispatches, while pure-review agents (`ecc-security-reviewer`, `ecc-performance-optimizer`, `ecc-python-reviewer`, `ecc-silent-failure-hunter`, `critical-thinking`) are stripped to read-only.
+- **Tool-capability split:** fix-capable agents (`python-pro`, `tdd-guide`, `refactor-cleaner`, `unused-code-cleaner`) deliberately retain `Write` / `Edit` so they can author tests and execute refactors in fix-pass dispatches, while pure-review agents (`security-reviewer`, `performance-optimizer`, `python-reviewer`, `silent-failure-hunter`, `critical-thinking`) are stripped to read-only.
 
 ## Slice quick-reference
 
