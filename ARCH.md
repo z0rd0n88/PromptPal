@@ -125,8 +125,8 @@ PromptPal/
 │   │   └── SKILL.md
 │   └── ralph/
 │       ├── AGENTS.md
-│       ├── CLAUDE.md
 │       ├── progress.txt
+│       ├── prompt-claude.md
 │       ├── ralph.sh
 │       └── SKILL.md
 ├── tests/  — pytest suite split into `unit/` (fast, fake runners) and `integration/` (end-to-end through `core.cli.main` with injected fakes, plus winget launcher contract tests).
@@ -166,5 +166,5 @@ PromptPal/
 └── uninstall.sh  — bash uninstaller that removes `~/.local/bin/promptpal` and optionally purges the `~/.promptpal/` data directory.
 ```
 
-_Generated 2026-10-26 16:59 UTC · 96 files · 33 directories._
+_Generated 2026-10-26 17:07 UTC · 96 files · 33 directories._
 <!-- ARCH:TREE:END -->
