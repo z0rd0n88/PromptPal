@@ -20,7 +20,7 @@ PromptPal is a stdlib-only Python 3.10+ CLI that pipes a raw prompt through a sy
 - `skills/` — repo-local Claude Code skill (`ralph/`) providing the Ralph autonomous-agent loop instructions, PRD, and shell driver script.
 - `tests/` — pytest suite split into `unit/` (fast, fake runners) and `integration/` (end-to-end through `core.cli.main` with injected fakes, plus winget launcher contract tests).
 - `.gitignore` — version-control exclusions for this repo (Python caches, install artifacts, local data dirs).
-- `CLAUDE.md` — project-specific instructions for Claude Code sessions: stdlib constraint, cli_backend quirks, test invocation, and reinstall workflow.
+- `AGENTS.md` — project-specific instructions for Claude Code sessions: stdlib constraint, cli_backend quirks, test invocation, and reinstall workflow.
 - `conftest.py` — top-level pytest conftest that inserts the repo root onto `sys.path` so `import core.*` resolves correctly without an installable package.
 - `install.sh` — bash installer that copies `core/` and `defaults/` into `~/.promptpal/lib/`, seeds user config files once, and generates the `~/.local/bin/promptpal` launcher.
 - `PRD-PHASE1.md` — human-readable Phase 1 product requirements document defining all user stories and acceptance criteria tracked by the Ralph agent.
@@ -125,8 +125,8 @@ PromptPal/
 │   │   └── SKILL.md
 │   └── ralph/
 │       ├── AGENTS.md
-│       ├── CLAUDE.md
 │       ├── progress.txt
+│       ├── prompt-claude.md
 │       ├── ralph.sh
 │       └── SKILL.md
 ├── tests/  — pytest suite split into `unit/` (fast, fake runners) and `integration/` (end-to-end through `core.cli.main` with injected fakes, plus winget launcher contract tests).
@@ -155,8 +155,8 @@ PromptPal/
 │   │   └── test_winget_launcher.py
 │   └── __init__.py
 ├── .gitignore  — version-control exclusions for this repo (Python caches, install artifacts, local data dirs).
+├── AGENTS.md  — project-specific instructions for Claude Code sessions: stdlib constraint, cli_backend quirks, test invocation, and reinstall workflow.
 ├── ARCH.md
-├── CLAUDE.md  — project-specific instructions for Claude Code sessions: stdlib constraint, cli_backend quirks, test invocation, and reinstall workflow.
 ├── conftest.py  — top-level pytest conftest that inserts the repo root onto `sys.path` so `import core.*` resolves correctly without an installable package.
 ├── install.sh  — bash installer that copies `core/` and `defaults/` into `~/.promptpal/lib/`, seeds user config files once, and generates the `~/.local/bin/promptpal` launcher.
 ├── PRD-PHASE1.md  — human-readable Phase 1 product requirements document defining all user stories and acceptance criteria tracked by the Ralph agent.
@@ -166,5 +166,5 @@ PromptPal/
 └── uninstall.sh  — bash uninstaller that removes `~/.local/bin/promptpal` and optionally purges the `~/.promptpal/` data directory.
 ```
 
-_Generated 2026-08-08 11:43 UTC · 96 files · 33 directories._
+_Generated 2026-10-26 17:07 UTC · 96 files · 33 directories._
 <!-- ARCH:TREE:END -->

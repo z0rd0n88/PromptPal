@@ -1,4 +1,4 @@
-# CLAUDE.md
+# AGENTS.md
 
 ## Architecture constraints
 - Core is **stdlib-only by design** (PRD D-1/D-2): no third-party imports, no
