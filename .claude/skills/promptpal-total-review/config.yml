@@ -50,7 +50,7 @@ slices:
 
   backends:
     # Both backend adapters + the abstract base. The fragile part of the codebase
-    # per CLAUDE.md; cli-backend-reviewer is the project-specific lens.
+    # per AGENTS.md; cli-backend-reviewer is the project-specific lens.
     paths:
       - core/backend.py
       - core/api_backend.py

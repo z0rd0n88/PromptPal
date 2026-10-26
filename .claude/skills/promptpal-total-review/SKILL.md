@@ -40,7 +40,7 @@ In addition to OWASP A01–A10:
 | `architecture` | Backend abstraction integrity, cli↔core boundary, silent-failure ladder — files issue |
 | `test` | Coverage + fake parity (api/cli backend fakes), requirement-ID pinning — files issue |
 | `perf` | Subprocess startup overhead, NDJSON parse hot path, history-index O(n) growth — files issue |
-| `docs` | `ARCH.md` / PRD / `CLAUDE.md` drift — inline patch or small issue |
+| `docs` | `ARCH.md` / PRD / `AGENTS.md` drift — inline patch or small issue |
 | `pre-pr` | Diff-only sanity check before opening a PR — inline summary, no issue |
 
 `all` = every mode except `pre-pr`, one issue per mode.
@@ -56,7 +56,7 @@ In addition to OWASP A01–A10:
 The `config.yml` declares seven layer slices:
 
 - `cli` — `core/cli.py`, `core/main.py`, `core/__init__.py`, **`core/resolve.py`** (moved here from `state` 2026-06-07; it's a path resolver, not a state writer). Lenses include `silent-failure-hunter` (owns the exit-code / error funnel) and `code-architect`.
-- `backends` — both backend adapters + the abstract base. The fragile part per CLAUDE.md.
+- `backends` — both backend adapters + the abstract base. The fragile part per AGENTS.md.
 - `state` — config + history + system-prompt + atomic I/O (everything writing to `~/.promptpal/`).
 - `loop` — interactive accept/iterate/discard, diff renderer, input parser. `silent-failure-hunter` joins here for parity with `backends`/`state`.
 - `platform` — platform detection + winget launcher wiring.
